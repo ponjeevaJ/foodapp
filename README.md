@@ -34,7 +34,7 @@ npm start
 npm run dev
 ```
 
-The API listens on `http://localhost:3000` (override with `PORT`); the UI is at `http://localhost:5173` and proxies `/api` requests to it. Create a production UI build with `npm run build`.
+The API listens on `http://localhost:3000` (override with `PORT`); the UI is at `http://localhost:5173` and proxies `/api` requests to it. Create a production UI build with `npm run build`. On Vercel, `api/[...path].js` serves the same API routes as serverless functions, so location search and geocoding work in production as well. This project uses Photon and Nominatim and does not require a Google Maps/Places API key; no client-side API key is needed.
 
 ## Compare API
 

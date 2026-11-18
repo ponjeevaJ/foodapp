@@ -1,6 +1,8 @@
 import { afterEach, expect, test, vi } from "vitest";
 import request from "supertest";
+import { createServer as createHttpServer } from "node:http";
 import serverModule from "../src/server.js";
+import vercelApiHandler from "../api/[...path].js";
 import sampleAdapter from "../src/adapters/mockAdapter.js";
 
 const { createServer } = serverModule;
@@ -27,6 +29,15 @@ afterEach(async () => {
   await Promise.all(servers.splice(0).map((server) =>
     new Promise((resolve) => server.close(resolve))
   ));
+});
+
+test("Vercel API entry point dispatches API routes", async () => {
+  const app = createHttpServer(vercelApiHandler);
+  servers.push(app);
+  const response = await request(app).get("/api/suggest").query({ q: "bir" });
+
+  expect(response.status).toBe(200);
+  expect(response.body).toHaveProperty("suggestions");
 });
 
 test("returns only sample menu items that match a UTF-8 food query", async () => {

@@ -38,6 +38,9 @@ test("searches biryani at a selected location and highlights the cheapest app", 
   const locationInput = page.locator("#location-input");
   await locationInput.fill("Indiranagar, Bengaluru, India");
   await page.getByRole("option", { name: /Indiranagar, Bengaluru, 560038/ }).click();
+  const mapDialog = page.getByRole("dialog", { name: "Pick on map" });
+  await expect(mapDialog).toContainText("Indiranagar, Bengaluru, India");
+  await mapDialog.getByRole("button", { name: "OK / Confirm Location" }).click();
 
   const foodInput = page.getByRole("combobox", { name: "Dish or cuisine" });
   await foodInput.fill("biryani");
@@ -62,6 +65,7 @@ test("searches biryani at a selected location and highlights the cheapest app", 
 });
 
 test("picks a map location, confirms it, and compares coupon-adjusted chicken rice prices", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
   const savedLocation = {
     label: "Seed Area, Bengaluru, India",
     area: "Seed Area",
@@ -105,8 +109,13 @@ test("picks a map location, confirms it, and compares coupon-adjusted chicken ri
   await map.waitFor();
   const bounds = await map.boundingBox();
   await page.mouse.click(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
-  await expect(page.getByRole("dialog").getByText(/Selected: Map Picked Area, Bengaluru 560038/)).toBeVisible();
-  await page.getByRole("button", { name: "Confirm location" }).click();
+  const mapDialog = page.getByRole("dialog", { name: "Pick on map" });
+  await expect(mapDialog).toContainText("Map Picked Area, Bengaluru, India");
+  const confirmButton = mapDialog.getByRole("button", { name: "OK / Confirm Location" });
+  await expect(confirmButton).toBeVisible();
+  const confirmBounds = await confirmButton.boundingBox();
+  expect(confirmBounds.y + confirmBounds.height).toBeLessThanOrEqual(844);
+  await confirmButton.click();
 
   const confirmedLocation = await page.evaluate(() =>
     JSON.parse(localStorage.getItem("platewise.lastLocation"))
@@ -175,11 +184,10 @@ test("uses current location, shows its reverse-geocoded name, and opens the corr
   await page.goto("/");
 
   await page.getByRole("button", { name: "Use current location" }).click();
-  await expect(page.getByRole("group", { name: "Confirm detected location" }))
-    .toContainText("Detected: Indiranagar, Bengaluru 560038");
-  await expect(page.getByRole("group", { name: "Confirm detected location" }))
-    .toContainText("(12.97160, 77.59460)");
-  await page.getByRole("button", { name: "Confirm location" }).click();
+  const mapDialog = page.getByRole("dialog", { name: "Pick on map" });
+  await expect(mapDialog).toContainText("Indiranagar, Bengaluru 560038");
+  await expect(mapDialog).toContainText("(12.97160, 77.59460)");
+  await mapDialog.getByRole("button", { name: "OK / Confirm Location" }).click();
 
   const locationInput = page.locator("#location-input");
   await expect(locationInput).toHaveValue("Indiranagar, Bengaluru 560038");
@@ -207,6 +215,6 @@ test("uses current location, shows its reverse-geocoded name, and opens the corr
   await confirmation.getByRole("button", { name: `Open ${appName}` }).click();
   const popup = await popupPromise;
   const openedUrl = new URL(popup.url());
-  expect(openedUrl.searchParams.get("query")).toBe(`${shopName} Indiranagar Bengaluru`);
+  expect(openedUrl.searchParams.get("query")).toBe(`${shopName} Indiranagar, Bengaluru 560038`);
   expect(openedUrl.hostname).toMatch(/zomato\.com|swiggy\.com|toing\.com/);
 });

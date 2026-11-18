@@ -115,10 +115,18 @@ function addressNotFoundMessage(coordinates) {
 async function fetchReverseGeocode(lat, lng, signal) {
   const requestUrl = `/api/reverse-geocode?lat=${encodeURIComponent(lat)}&lng=${encodeURIComponent(lng)}`;
   console.info("Reverse geocode coordinates:", { lat, lng });
-  const response = await fetch(requestUrl, { signal });
-  const body = await response.json();
-  console.info("Reverse geocode response:", { lat, lng, body });
-  return { response, body };
+  try {
+    const response = await fetch(requestUrl, { signal });
+    const body = await response.json();
+    console.info("Reverse geocode response:", { lat, lng, body });
+    if (!response.ok || body.addressFound === false) {
+      console.error("Reverse geocoding failed:", { lat, lng, status: response.status, body });
+    }
+    return { response, body };
+  } catch (error) {
+    console.error("Reverse geocoding request failed:", { lat, lng, error });
+    throw error;
+  }
 }
 
 function rerank(options, priority) {
@@ -620,6 +628,7 @@ export default function App() {
 
   async function useCurrentLocation() {
     if (!window.isSecureContext) {
+      console.error("Current location requires a secure context.");
       setLocationMessage({
         type: "error",
         text: "Location needs HTTPS or localhost. On your phone, open this app through an HTTPS tunnel such as ngrok or configure Vite for HTTPS."
@@ -627,6 +636,7 @@ export default function App() {
       return;
     }
     if (!navigator.geolocation) {
+      console.error("Current location is unavailable: geolocation is not supported.");
       setLocationMessage({
         type: "error",
         text: "This browser does not support location. Enter a city or address and choose a suggestion instead."
@@ -660,6 +670,7 @@ export default function App() {
       await pickMapLocation(coordinates, { source: "gps", accuracyMeters });
     } catch (locationError) {
       if (operationId !== locationOperationRef.current) return;
+      console.error("Current location request failed:", locationError);
       const messages = {
         1: "Location permission was denied. Enable it in your browser or phone settings, or enter a location manually.",
         2: "Your position is unavailable right now. Check device location services and retry, or enter a location manually.",
@@ -777,7 +788,13 @@ export default function App() {
   }
 
   function confirmMapLocation() {
-    if (!mapSelectionLocation?.address) return;
+    if (!mapSelectionLocation?.address) {
+      setLocationMessage({
+        type: "error",
+        text: "No address is available to confirm. Pick another point or search for an address."
+      });
+      return;
+    }
     saveLocation(
       mapSelectionLocation,
       `Location confirmed: ${mapSelectionLocation.label}`
@@ -820,6 +837,22 @@ export default function App() {
     setResult(null);
     setSearched(false);
     setLoading(false);
+    const coordinates = { lat: Number(suggestion.lat), lng: Number(suggestion.lng) };
+    const suggestionAddress = String(suggestion.address || suggestion.label);
+    const suggestionLocation = {
+      ...suggestion,
+      ...coordinates,
+      address: suggestionAddress,
+      label: suggestionAddress,
+      source: "manual",
+      accuracyMeters: null
+    };
+    setMapCenter(coordinates);
+    setMapSelectionLocation(suggestionLocation);
+    setMapOpen(true);
+    setLocationInput(suggestionAddress);
+    setLocationSuggestions([]);
+    setLocationSuggestionsOpen(false);
     setLocationBusy(true);
     setLocationMessage({ type: "status", text: "Verifying the selected location…" });
     const controller = new AbortController();
@@ -834,32 +867,37 @@ export default function App() {
       if (operationId !== locationOperationRef.current) return;
       if (controller.signal.aborted) return;
       if (!response.ok || body.addressFound === false || !body.location) {
-        const coordinates = { lat: Number(suggestion.lat), lng: Number(suggestion.lng) };
-        setMapCenter(coordinates);
-        setMapSelection(coordinates);
-        setMapSelectionLocation(null);
-        setMapOpen(true);
-        throw new Error(addressNotFoundMessage(coordinates));
+        setLocationMessage({
+          type: "error",
+          text: body.error || addressNotFoundMessage(coordinates)
+        });
+        return;
       }
       const verified = body.location;
       const normalize = (value) => String(value || "").toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
       if (!verified?.city || !verified?.country ||
         normalize(verified.city) !== normalize(suggestion.city) ||
         normalize(verified.country) !== normalize(suggestion.country)) {
+        setMapSelectionLocation({ ...suggestionLocation, address: "", label: "" });
+        setLocationInput("");
         throw new Error("That point does not resolve inside the selected city and country. Choose another suggestion.");
       }
-      saveLocation({
+      const selectedLocation = {
         ...verified,
-        address: String(verified.address || verified.label || body.address || ""),
-        label: String(verified.address || verified.label || body.address || ""),
+        address: String(verified.address || verified.label || body.address || suggestionAddress),
+        label: String(verified.address || verified.label || body.address || suggestionAddress),
         pincode: verified.pincode || suggestion.pincode || "",
-        lat: Number(suggestion.lat),
-        lng: Number(suggestion.lng),
+        ...coordinates,
         source: "manual",
         accuracyMeters: null
-      }, `Location selected: ${locationQuery(verified)}`);
+      };
+      setMapCenter(coordinates);
+      setMapSelectionLocation(selectedLocation);
+      setLocationInput(selectedLocation.address);
+      setLocationMessage({ type: "status", text: locationConfirmationText(selectedLocation) });
     } catch (verificationError) {
       if (operationId === locationOperationRef.current && verificationError.name !== "AbortError") {
+        console.error("Location suggestion verification failed:", verificationError);
         setLocationMessage({
           type: "error",
           text: verificationError.message || "The selected location could not be verified. Choose another suggestion."
@@ -1106,7 +1144,7 @@ export default function App() {
                 </button>
                 {location && <button className="plain-button" type="button" onClick={changeLocation}>Change</button>}
               </div>
-              {locationMessage && (
+              {locationMessage && !mapOpen && (
                 <div className={`location-message ${locationMessage.type === "error" ? "location-error" : ""}`} role="status">
                   <span>{locationMessage.text}</span>
                   {locationMessage.help && (
@@ -1178,24 +1216,28 @@ export default function App() {
                 <button className="plain-button" type="button" onClick={closeMapPicker}>Close</button>
               </div>
               <LocationMapPicker center={mapCenter} selectedPoint={mapSelectionLocation} onPick={pickMapLocation} />
-              {mapSelectionLocation?.address && (
-                <div className="map-location-confirmation">
-                  <p>{locationConfirmationText(mapSelectionLocation)}</p>
-                  <small className="location-coordinates">({formatCoordinates(mapSelectionLocation)})</small>
-                  {mapSelectionLocation.accuracyMeters !== null && (
-                    <small>GPS accuracy: about {Math.round(mapSelectionLocation.accuracyMeters)} m</small>
+              <div className="map-location-footer" aria-live="polite">
+                <div className="map-location-footer-address" aria-busy={locationBusy}>
+                  {mapSelectionLocation?.address
+                    ? <p>{mapSelectionLocation.address}</p>
+                    : <p>{locationBusy ? "Looking up the selected address…" : "Choose a point or search for an address."}</p>}
+                  {mapSelectionLocation && (
+                    <small className="location-coordinates">({formatCoordinates(mapSelectionLocation)})</small>
                   )}
-                  <button
-                    className="compare-button"
-                    type="button"
-                    disabled={locationBusy}
-                    onClick={confirmMapLocation}
-                  >
-                    Confirm location
-                  </button>
+                  {locationMessage?.type === "error" && (
+                    <p className="map-location-error" role="alert">{locationMessage.text}</p>
+                  )}
                 </div>
-              )}
-              {locationBusy && <p className="location-map-status">Looking up the selected point…</p>}
+                <button
+                  className="compare-button map-confirm-button"
+                  type="button"
+                  disabled={locationBusy}
+                  onClick={confirmMapLocation}
+                >
+                  {locationBusy && <span className="confirm-spinner" aria-hidden="true" />}
+                  <span>OK / Confirm Location</span>
+                </button>
+              </div>
             </section>
           </div>
         )}

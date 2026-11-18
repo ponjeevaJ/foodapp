@@ -74,6 +74,8 @@ async function selectManualLocation(user, name = "Indiranagar, Bengaluru, India"
   const input = screen.getByLabelText(/Your location/);
   fireEvent.change(input, { target: { value: name } });
   await user.click(await screen.findByRole("option", { name: new RegExp(name) }));
+  expect(screen.queryByRole("listbox", { name: "Location suggestions" })).not.toBeInTheDocument();
+  await user.click(await screen.findByRole("button", { name: "OK / Confirm Location" }));
 }
 
 test("does not search until a location is selected", async () => {
@@ -214,7 +216,7 @@ test("requests a secure current location, shows its address, and searches with n
   try {
     render(<App />);
     await user.click(screen.getByRole("button", { name: "Use current location" }));
-    expect(await screen.findAllByText("Selected: Pallavaram, Chennai 600043")).toHaveLength(2);
+    expect(await screen.findByText("5/3 Main Road, Pallavaram, Chennai, Tamil Nadu, 600043")).toBeInTheDocument();
     expect(screen.getByLabelText(/Your location/)).toHaveValue(
       "5/3 Main Road, Pallavaram, Chennai, Tamil Nadu, 600043"
     );
@@ -229,7 +231,7 @@ test("requests a secure current location, shows its address, and searches with n
     );
     expect(getCurrentPosition).toHaveBeenCalledOnce();
     expect(localStorage.getItem("platewise.lastLocation")).toBeNull();
-    await user.click(screen.getByRole("button", { name: "Confirm location" }));
+    await user.click(screen.getByRole("button", { name: "OK / Confirm Location" }));
     expect(JSON.parse(localStorage.getItem("platewise.lastLocation"))).toEqual({
       label: "5/3 Main Road, Pallavaram, Chennai, Tamil Nadu, 600043",
       address: "5/3 Main Road, Pallavaram, Chennai, Tamil Nadu, 600043",
@@ -300,7 +302,7 @@ test("opens the draggable map for GPS accuracy worse than 500 m and confirms onl
       JSON.stringify([12.34567, 77.12345])
     );
     expect(localStorage.getItem("platewise.lastLocation")).toBeNull();
-    await user.click(screen.getByRole("button", { name: "Confirm location" }));
+    await user.click(screen.getByRole("button", { name: "OK / Confirm Location" }));
     expect(JSON.parse(localStorage.getItem("platewise.lastLocation"))).toMatchObject({
       lat: 12.34567,
       lng: 77.12345,
@@ -352,7 +354,7 @@ test("map clicks preserve lat/lng, reverse geocode, and wait for confirmation be
     JSON.stringify([original.lat, original.lng])
   );
   await user.click(screen.getByRole("button", { name: "Test map click" }));
-  expect(await screen.findAllByText("Selected: Map Click Area, Bengaluru 560038")).toHaveLength(2);
+  expect(await screen.findByText("Map Click Area, Bengaluru, India")).toBeInTheDocument();
   expect(screen.getByTestId("location-map-picker")).toHaveAttribute(
     "data-center",
     JSON.stringify([12.34567, 77.12345])
@@ -369,7 +371,7 @@ test("map clicks preserve lat/lng, reverse geocode, and wait for confirmation be
     String(url).startsWith("/api/compare")
   )).toHaveLength(initialSearchCount);
 
-  await user.click(screen.getByRole("button", { name: "Confirm location" }));
+  await user.click(screen.getByRole("button", { name: "OK / Confirm Location" }));
   expect(JSON.parse(localStorage.getItem("platewise.lastLocation"))).toMatchObject({
     area: "Map Click Area",
     lat: 12.34567,
@@ -408,9 +410,9 @@ test("marker drag updates the confirmed shared location and the next search", as
 
   await user.click(screen.getByRole("button", { name: "Pick on map" }));
   await user.click(screen.getByRole("button", { name: "Test marker drag" }));
-  expect(await screen.findAllByText("Selected: Dragged Area, Bengaluru 560038")).toHaveLength(2);
+  expect(await screen.findByText("Dragged Area, Bengaluru, India")).toBeInTheDocument();
   expect(screen.getByText("(12.34678, 77.12456)")).toBeInTheDocument();
-  await user.click(screen.getByRole("button", { name: "Confirm location" }));
+  await user.click(screen.getByRole("button", { name: "OK / Confirm Location" }));
   expect(JSON.parse(localStorage.getItem("platewise.lastLocation"))).toMatchObject({
     area: "Dragged Area",
     lat: 12.34678,
@@ -449,15 +451,19 @@ test("ignores a stale reverse-geocode response after the marker moves again", as
   await user.click(screen.getByRole("button", { name: "Pick on map" }));
   await user.click(screen.getByRole("button", { name: "Test map click" }));
   await waitFor(() => expect(pending).toHaveLength(1));
+  const confirmButton = screen.getByRole("button", { name: "OK / Confirm Location" });
+  expect(confirmButton).toBeInTheDocument();
+  expect(confirmButton).toBeDisabled();
+  expect(confirmButton.querySelector(".confirm-spinner")).toBeInTheDocument();
   await user.click(screen.getByRole("button", { name: "Test marker drag" }));
   await waitFor(() => expect(pending).toHaveLength(2));
   expect(pending[0].signal.aborted).toBe(true);
 
   pending[1].resolve(selectedMapResponse(pending[1].url, "Newest Area"));
-  expect(await screen.findAllByText("Selected: Newest Area, Bengaluru 560038")).toHaveLength(2);
+  expect(await screen.findByText("Newest Area, Bengaluru, India")).toBeInTheDocument();
   pending[0].resolve(selectedMapResponse(pending[0].url, "Stale Area"));
   await waitFor(() => {
-    expect(screen.getAllByText("Selected: Newest Area, Bengaluru 560038")).toHaveLength(2);
+    expect(screen.getByText("Newest Area, Bengaluru, India")).toBeInTheDocument();
     expect(screen.queryByText(/Stale Area/)).not.toBeInTheDocument();
   });
 });
@@ -488,12 +494,15 @@ test("shows coordinates and a draggable map fallback when reverse geocoding fail
     render(<App />);
     await user.click(screen.getByRole("button", { name: "Use current location" }));
     expect(await screen.findByText(/Address not found\. Drag the pin or type your area/)).toBeInTheDocument();
-    expect(screen.getByText(/12\.34567, 77\.12345/)).toBeInTheDocument();
+    expect(screen.getAllByText(/12\.34567, 77\.12345/).length).toBeGreaterThan(0);
     expect(screen.getByTestId("location-map-picker")).toHaveAttribute(
       "data-point",
       JSON.stringify([12.34567, 77.12345])
     );
-    expect(screen.queryByRole("button", { name: "Confirm location" })).not.toBeInTheDocument();
+    const confirmButton = screen.getByRole("button", { name: "OK / Confirm Location" });
+    expect(confirmButton).toBeEnabled();
+    await user.click(confirmButton);
+    expect(await screen.findByText(/No address is available to confirm/)).toBeInTheDocument();
   } finally {
     if (oldGeolocation) Object.defineProperty(navigator, "geolocation", oldGeolocation);
     else delete navigator.geolocation;
@@ -537,7 +546,14 @@ test("explains how to restore a denied location permission", async () => {
     expect(screen.getByTestId("location-map-picker")).toHaveAttribute("data-point", "");
     await user.click(screen.getByRole("button", { name: "Test map click" }));
     expect(await screen.findByLabelText(/Your location/)).toHaveValue("Manual Map Area, Bengaluru, India");
-    expect(screen.getByRole("button", { name: "Confirm location" })).toBeInTheDocument();
+    const confirmButton = screen.getByRole("button", { name: "OK / Confirm Location" });
+    expect(confirmButton).toBeEnabled();
+    await user.click(confirmButton);
+    expect(JSON.parse(localStorage.getItem("platewise.lastLocation"))).toMatchObject({
+      lat: 12.34567,
+      lng: 77.12345,
+      address: "Manual Map Area, Bengaluru, India"
+    });
   } finally {
     for (const [target, property, descriptor] of [
       [navigator, "permissions", oldPermission],
@@ -652,6 +668,9 @@ test("accepts a pincode query and displays area, city, and pincode before select
   const locationUrl = new URL(String(fetchMock.mock.calls[0][0]), "http://localhost");
   expect(locationUrl.searchParams.get("q")).toBe("560038");
   await user.click(option);
+  expect(await screen.findByRole("button", { name: "OK / Confirm Location" })).toBeEnabled();
+  expect(JSON.parse(localStorage.getItem("platewise.lastLocation"))).toBeNull();
+  await user.click(screen.getByRole("button", { name: "OK / Confirm Location" }));
 
   expect(JSON.parse(localStorage.getItem("platewise.lastLocation"))).toMatchObject({
     area: "Indiranagar",
@@ -694,6 +713,8 @@ test("selecting a Tambaram suggestion saves its exact coordinates", async () => 
 
   fireEvent.change(screen.getByLabelText(/Your location/), { target: { value: "Tambaram" } });
   await user.click(await screen.findByRole("option", { name: /West Tambaram, Tambaram, 600045/ }));
+  expect(await screen.findByRole("button", { name: "OK / Confirm Location" })).toBeEnabled();
+  await user.click(screen.getByRole("button", { name: "OK / Confirm Location" }));
 
   expect(JSON.parse(localStorage.getItem("platewise.lastLocation"))).toMatchObject({
     area: "West Tambaram",
