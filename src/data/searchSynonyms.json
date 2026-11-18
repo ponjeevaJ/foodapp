@@ -1,0 +1,19 @@
+{
+  "popularDishes": [
+    "Chicken Dum Biryani",
+    "Paneer Dum Biryani",
+    "Masala Dosa",
+    "Chicken 65",
+    "Parotta",
+    "Butter Chicken",
+    "Idli Sambar",
+    "Veg Fried Rice"
+  ],
+  "groups": [
+    { "canonical": "biryani", "terms": ["biryani", "biriyani", "briyani", "chicken biryani"] },
+    { "canonical": "parotta", "terms": ["parotta", "paratha", "porotta"] },
+    { "canonical": "meals", "terms": ["meals", "veg meals", "thali"] },
+    { "canonical": "paneer", "terms": ["paneer", "panner"] },
+    { "canonical": "chicken 65", "terms": ["chicken 65", "chicken sixty five"] }
+  ]
+}
