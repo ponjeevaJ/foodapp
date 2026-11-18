@@ -9,6 +9,12 @@ import {
 import { cheapestOption, savingsBetween } from "./domain/cheapest.mjs";
 import couponData from "./data/coupons.sample.json";
 import LocationMapPicker from "./LocationMapPicker.jsx";
+import {
+  getGooglePlaceLocation,
+  hasGoogleMapsApiKey,
+  reverseGeocodeGoogle,
+  searchGooglePlaces
+} from "./googleMaps.js";
 
 const PRIORITIES = ["Best overall", "Cheapest", "Fastest", "Best rated"];
 const POPULAR_DISHES = [
@@ -23,7 +29,8 @@ const POPULAR_DISHES = [
 ];
 const RECENT_SEARCH_KEY = "platewise.recentSearches";
 const LAST_LOCATION_KEY = "platewise.lastLocation";
-const MAP_FALLBACK_CENTER = { lat: 0, lng: 0 };
+const MAP_DEFAULT_CENTER = { lat: 13.0827, lng: 80.2707 };
+const TAMIL_NADU_BOUNDS = { south: 8, west: 76.2, north: 13.6, east: 80.4 };
 const WEIGHTS = {
   "Best overall": { price: 40, rating: 25, delivery: 20, reliability: 10, distance: 5 },
   Cheapest: { price: 70, rating: 10, delivery: 10, reliability: 5, distance: 5 },
@@ -73,16 +80,24 @@ function readRecentSearches() {
 function readSavedLocation() {
   try {
     const saved = JSON.parse(localStorage.getItem(LAST_LOCATION_KEY) || "null");
-    if (saved && typeof saved.label === "string" && saved.label.trim() &&
-      typeof saved.area === "string" && saved.area.trim() &&
-      typeof saved.city === "string" && saved.city.trim() &&
-      typeof saved.country === "string" && saved.country.trim() &&
-      typeof saved.pincode === "string" && ["gps", "manual"].includes(saved.source) &&
+    const state = String(saved?.state || "").replace(/\s+/g, "").toLocaleLowerCase();
+    if (saved && typeof (saved.address || saved.label) === "string" &&
+      String(saved.address || saved.label).trim() &&
+      (state === "tamilnadu" || saved.manuallyEntered === true) &&
+      ["gps", "manual"].includes(saved.source) &&
       Number.isFinite(saved.lat) && Number.isFinite(saved.lng) &&
-      saved.lat >= -90 && saved.lat <= 90 && saved.lng >= -180 && saved.lng <= 180) {
+      saved.lat >= TAMIL_NADU_BOUNDS.south && saved.lat <= TAMIL_NADU_BOUNDS.north &&
+      saved.lng >= TAMIL_NADU_BOUNDS.west && saved.lng <= TAMIL_NADU_BOUNDS.east) {
       return {
         ...saved,
         address: saved.address || saved.label,
+        label: saved.address || saved.label,
+        area: saved.area || saved.address || saved.label,
+        city: saved.city || "",
+        district: saved.district || "",
+        country: saved.country || "",
+        state: saved.state || "",
+        pincode: typeof saved.pincode === "string" ? saved.pincode : "",
         accuracyMeters: Number.isFinite(saved.accuracyMeters) ? saved.accuracyMeters : null
       };
     }
@@ -104,8 +119,7 @@ function formatCoordinates(location) {
 }
 
 function locationConfirmationText(location) {
-  const pincode = location.pincode ? ` ${location.pincode}` : "";
-  return `Selected: ${location.area}, ${location.city}${pincode}`;
+  return `Selected: ${location.address || location.label}`;
 }
 
 function addressNotFoundMessage(coordinates) {
@@ -127,6 +141,15 @@ async function fetchReverseGeocode(lat, lng, signal) {
     console.error("Reverse geocoding request failed:", { lat, lng, error });
     throw error;
   }
+}
+
+async function reverseGeocodeLocation(lat, lng, signal) {
+  if (!hasGoogleMapsApiKey()) return fetchReverseGeocode(lat, lng, signal);
+  const location = await reverseGeocodeGoogle(lat, lng);
+  return {
+    response: { ok: true, status: 200 },
+    body: { address: location.address, addressFound: true, location }
+  };
 }
 
 function rerank(options, priority) {
@@ -239,6 +262,7 @@ export default function App() {
   const savedLocation = readSavedLocation();
   const [location, setLocation] = useState(savedLocation);
   const [locationInput, setLocationInput] = useState(locationQuery(savedLocation));
+  const [mapSearchInput, setMapSearchInput] = useState("");
   const [form, setForm] = useState({
     food: "Chicken Dum Biryani",
     shopName: "",
@@ -285,9 +309,6 @@ export default function App() {
   const locationOperationRef = useRef(0);
   const locationInputRef = useRef(null);
   const lastSearchRef = useRef(null);
-  const locationBiasRef = useRef(savedLocation
-    ? { city: savedLocation.city, lat: savedLocation.lat, lng: savedLocation.lng }
-    : { city: "", lat: NaN, lng: NaN });
 
   const rankedGroups = useMemo(() => (result?.groups || []).map((group) => ({
     ...group,
@@ -401,8 +422,8 @@ export default function App() {
   }, [form.food, recentSearches, suggestionsOpen]);
 
   useEffect(() => {
-    const query = locationInput.trim();
-    if (location || mapSelectionLocation || query.length < 3) {
+    const query = (mapOpen ? mapSearchInput : locationInput).trim();
+    if ((!mapOpen && location) || query.length < 3) {
       setLocationSuggestions([]);
       setLocationSearching(false);
       return undefined;
@@ -414,32 +435,34 @@ export default function App() {
       setLocationSearching(true);
       setLocationMessage({ type: "status", text: "Searching..." });
       try {
-        const params = new URLSearchParams({ q: query });
-        const bias = locationBiasRef.current;
-        if (bias.city) params.set("city", bias.city);
-        if (Number.isFinite(bias.lat) && Number.isFinite(bias.lng)) {
-          params.set("lat", String(bias.lat));
-          params.set("lng", String(bias.lng));
+        let matches;
+        let fallback = false;
+        let originalQuery = query;
+        if (hasGoogleMapsApiKey()) {
+          matches = await searchGooglePlaces(query);
+        } else {
+          const params = new URLSearchParams({ q: query });
+          const response = await fetch(`/api/location-suggest?${params}`, {
+            signal: controller.signal
+          });
+          const body = await response.json();
+          if (!response.ok) throw new Error(body.error || "Location suggestions could not be loaded.");
+          matches = body.locations || [];
+          fallback = body.fallback;
+          originalQuery = body.originalQuery || query;
         }
-        const requestUrl = `/api/location-suggest?${params}`;
-        const response = await fetch(requestUrl, {
-          signal: controller.signal
-        });
-        const body = await response.json();
-        if (!response.ok) throw new Error(body.error || "Location suggestions could not be loaded.");
         if (!controller.signal.aborted) {
-          const matches = (body.locations || []).slice(0, 6);
-          setLocationSuggestions(matches);
+          setLocationSuggestions(matches.slice(0, 6));
           setLocationSuggestionsOpen(true);
           if (!matches.length) {
             setLocationMessage({
               type: "error",
               text: `No places found for '${query}'. Try the area name or pincode.`
             });
-          } else if (body.fallback) {
+          } else if (fallback) {
             setLocationMessage({
               type: "status",
-              text: `Showing nearby matches for ${body.originalQuery || query}.`
+              text: `Showing nearby matches for ${originalQuery}.`
             });
           } else {
             setLocationMessage({ type: "status", text: "Choose the correct location from the suggestions." });
@@ -451,18 +474,20 @@ export default function App() {
           setLocationMessage({
             type: "error",
             retryable: true,
-            text: "Location service unavailable. Check your internet and try again"
+            text: hasGoogleMapsApiKey()
+              ? suggestionError.message
+              : "Location service unavailable. Check your internet and try again"
           });
         }
       } finally {
         if (locationSuggestionController.current === controller) setLocationSearching(false);
       }
-    }, 300);
+    }, 500);
     return () => {
       clearTimeout(timer);
       controller.abort();
     };
-  }, [locationInput, location, mapSelectionLocation, locationSearchRetry]);
+  }, [locationInput, mapOpen, mapSearchInput, location, locationSearchRetry]);
 
   useEffect(() => {
     try {
@@ -527,6 +552,7 @@ export default function App() {
       params.set("address", location.address || location.label);
       params.set("area", location.area);
       params.set("city", location.city);
+      params.set("district", location.district || "");
       params.set("country", location.country);
       params.set("pincode", location.pincode || "");
       params.set("source", location.source);
@@ -578,6 +604,9 @@ export default function App() {
       address: String(nextLocation.address || nextLocation.label || ""),
       label: String(nextLocation.address || nextLocation.label || ""),
       pincode: String(nextLocation.pincode || ""),
+      area: String(nextLocation.area || nextLocation.address || nextLocation.label || ""),
+      city: String(nextLocation.city || ""),
+      district: String(nextLocation.district || ""),
       accuracyMeters: typeof nextLocation.accuracyMeters === "number" &&
         Number.isFinite(nextLocation.accuracyMeters)
         ? Number(nextLocation.accuracyMeters)
@@ -588,11 +617,6 @@ export default function App() {
     setSearched(false);
     setLoading(false);
     setError("");
-    locationBiasRef.current = {
-      city: savedLocation.city || "",
-      lat: savedLocation.lat,
-      lng: savedLocation.lng
-    };
     setLocation(savedLocation);
     setLocationInput(locationQuery(savedLocation));
     setLocationSuggestions([]);
@@ -652,7 +676,7 @@ export default function App() {
       const position = await new Promise((resolve, reject) => {
         navigator.geolocation.getCurrentPosition(resolve, reject, {
           enableHighAccuracy: true,
-          timeout: 15000,
+          timeout: 10000,
           maximumAge: 0
         });
       });
@@ -693,13 +717,19 @@ export default function App() {
       const point = { lat: Number(location.lat), lng: Number(location.lng) };
       setMapCenter(point);
       setMapSelectionLocation(location);
+      setMapSearchInput("");
+      setLocationSuggestions([]);
+      setLocationSuggestionsOpen(false);
       setMapOpen(true);
       setLocationMessage({ type: "status", text: "Drag the pin or choose a point, then confirm." });
       return;
     }
     if (operationId !== locationOperationRef.current) return;
-    setMapCenter(MAP_FALLBACK_CENTER);
+    setMapCenter(MAP_DEFAULT_CENTER);
     setMapSelectionLocation(null);
+    setMapSearchInput("");
+    setLocationSuggestions([]);
+    setLocationSuggestionsOpen(false);
     setMapOpen(true);
     setLocationMessage({
       type: "status",
@@ -734,20 +764,41 @@ export default function App() {
     locationConfirmController.current?.abort();
     locationConfirmController.current = controller;
     try {
-      const { response, body } = await fetchReverseGeocode(
+      const { response, body } = await reverseGeocodeLocation(
         coordinates.lat,
         coordinates.lng,
         controller.signal
       );
       if (operationId !== locationOperationRef.current) return;
       if (controller.signal.aborted) return;
-      if (!response.ok || body.addressFound === false || !body.location?.area ||
-        !body.location?.city || !body.location?.country) {
-        setLocationMessage({ type: "error", text: addressNotFoundMessage(coordinates) });
+      if (!response.ok || body.addressFound === false || !body.location?.address) {
+        if (response.status === 422) {
+          setMapSelectionLocation((current) => current
+            ? { ...current, outsideTamilNadu: true }
+            : current);
+        }
+        setLocationMessage({
+          type: "error",
+          text: body.error || addressNotFoundMessage(coordinates)
+        });
+        return;
+      }
+      if (String(body.location.state || "").replace(/\s+/g, "").toLocaleLowerCase() !== "tamilnadu") {
+        setMapSelectionLocation((current) => current
+          ? { ...current, outsideTamilNadu: true }
+          : current);
+        setLocationMessage({
+          type: "error",
+          text: "This location service covers Tamil Nadu only. Choose a point within Tamil Nadu."
+        });
         return;
       }
       if (String(body.location.country).toLocaleLowerCase() !== "india") {
-        throw new Error("Choose a map point in India.");
+        setLocationMessage({
+          type: "error",
+          text: "This location service covers Tamil Nadu only. Choose a point within Tamil Nadu."
+        });
+        return;
       }
       const selectedLocation = {
         ...body.location,
@@ -766,11 +817,8 @@ export default function App() {
       }
       setMapSelectionLocation(selectedLocation);
       setLocationInput(selectedLocation.address);
-      if (Number(metadata.accuracyMeters) > 500) {
-        setLocationMessage({
-          type: "error",
-          text: `Location accuracy is low (about ${Math.round(metadata.accuracyMeters)} m). Drag the pin on the map to correct it`
-        });
+      if (Number(metadata.accuracyMeters) > 100) {
+        setLocationMessage({ type: "status", text: "Location is approximate, drag the pin to your exact place." });
       } else {
         setLocationMessage({ type: "status", text: locationConfirmationText(selectedLocation) });
       }
@@ -778,7 +826,7 @@ export default function App() {
       if (operationId === locationOperationRef.current && mapError.name !== "AbortError") {
         setLocationMessage({
           type: "error",
-          text: addressNotFoundMessage(coordinates)
+          text: mapError.message || addressNotFoundMessage(coordinates)
         });
       }
     } finally {
@@ -787,17 +835,49 @@ export default function App() {
     }
   }
 
-  function confirmMapLocation() {
-    if (!mapSelectionLocation?.address) {
+  function confirmMapLocation(pendingLocation = mapSelectionLocation) {
+    if (pendingLocation?.outsideTamilNadu) {
       setLocationMessage({
         type: "error",
-        text: "No address is available to confirm. Pick another point or search for an address."
+        text: "This location service covers Tamil Nadu only. Move the pin to a point within Tamil Nadu."
       });
       return;
     }
+    if (!pendingLocation?.address?.trim()) {
+      setLocationMessage({
+        type: "error",
+        text: "Enter an address or choose a place on the map before confirming."
+      });
+      return;
+    }
+    if (pendingLocation.lat < TAMIL_NADU_BOUNDS.south ||
+      pendingLocation.lat > TAMIL_NADU_BOUNDS.north ||
+      pendingLocation.lng < TAMIL_NADU_BOUNDS.west ||
+      pendingLocation.lng > TAMIL_NADU_BOUNDS.east) {
+      setLocationMessage({
+        type: "error",
+        text: "This location service covers Tamil Nadu only. Choose a point within Tamil Nadu."
+      });
+      return;
+    }
+    if (!pendingLocation.state &&
+      locationMessage?.text?.includes("Tamil Nadu only")) {
+      setLocationMessage({
+        type: "error",
+        text: "Verify the point is in Tamil Nadu, or move the pin before confirming."
+      });
+      return;
+    }
+    const address = pendingLocation.address.trim();
     saveLocation(
-      mapSelectionLocation,
-      `Location confirmed: ${mapSelectionLocation.label}`
+      {
+        ...pendingLocation,
+        address,
+        label: address,
+        area: pendingLocation.area || address,
+        ...(pendingLocation.state ? {} : { manuallyEntered: true })
+      },
+      `Location confirmed: ${address}`
     );
     setMapOpen(false);
     setMapSelectionLocation(null);
@@ -810,7 +890,8 @@ export default function App() {
     setMapSelectionLocation(null);
     setMapCenter(location
       ? { lat: Number(location.lat), lng: Number(location.lng) }
-      : MAP_FALLBACK_CENTER);
+      : MAP_DEFAULT_CENTER);
+    setMapSearchInput("");
     setLocationInput(locationQuery(location));
     setLocationBusy(false);
   }
@@ -825,43 +906,63 @@ export default function App() {
   }
 
   async function selectLocation(suggestion) {
-    if (!Number.isFinite(Number(suggestion.lat)) || Number(suggestion.lat) < -90 ||
-      Number(suggestion.lat) > 90 || !Number.isFinite(Number(suggestion.lng)) ||
-      Number(suggestion.lng) < -180 || Number(suggestion.lng) > 180 ||
-      !suggestion.area || !suggestion.city || !suggestion.country || !suggestion.label) {
-      setLocationMessage({ type: "error", text: "That location could not be selected. Choose another suggestion." });
-      return;
-    }
     const operationId = ++locationOperationRef.current;
+    locationConfirmController.current?.abort();
     compareController.current?.abort();
     setResult(null);
     setSearched(false);
     setLoading(false);
-    const coordinates = { lat: Number(suggestion.lat), lng: Number(suggestion.lng) };
-    const suggestionAddress = String(suggestion.address || suggestion.label);
-    const suggestionLocation = {
-      ...suggestion,
-      ...coordinates,
-      address: suggestionAddress,
-      label: suggestionAddress,
-      source: "manual",
-      accuracyMeters: null
-    };
-    setMapCenter(coordinates);
-    setMapSelectionLocation(suggestionLocation);
-    setMapOpen(true);
-    setLocationInput(suggestionAddress);
+    setMapSearchInput("");
     setLocationSuggestions([]);
     setLocationSuggestionsOpen(false);
     setLocationBusy(true);
-    setLocationMessage({ type: "status", text: "Verifying the selected location…" });
+    setLocationMessage({ type: "status", text: "Loading the selected location…" });
     const controller = new AbortController();
-    locationConfirmController.current?.abort();
     locationConfirmController.current = controller;
     try {
-      const { response, body } = await fetchReverseGeocode(
-        Number(suggestion.lat),
-        Number(suggestion.lng),
+      const isGooglePlace = Boolean(suggestion.placeId && hasGoogleMapsApiKey());
+      const place = isGooglePlace
+        ? await getGooglePlaceLocation(suggestion.placeId)
+        : suggestion;
+      const state = String(place.state || "").replace(/\s+/g, "").toLocaleLowerCase();
+      const coordinates = { lat: Number(place.lat), lng: Number(place.lng) };
+      const address = String(place.address || place.label || place.description || "").trim();
+      const country = String(place.country || "").toLocaleLowerCase();
+      if (!Number.isFinite(coordinates.lat) || coordinates.lat < TAMIL_NADU_BOUNDS.south ||
+        coordinates.lat > TAMIL_NADU_BOUNDS.north ||
+        !Number.isFinite(coordinates.lng) || coordinates.lng < TAMIL_NADU_BOUNDS.west ||
+        coordinates.lng > TAMIL_NADU_BOUNDS.east ||
+        state !== "tamilnadu" || country !== "india" ||
+        !place.area || !place.city || !address) {
+        setLocationMessage({
+          type: "error",
+          text: "Choose a search result within Tamil Nadu."
+        });
+        return;
+      }
+      const suggestionLocation = {
+        ...place,
+        ...coordinates,
+        address,
+        label: address,
+        source: "manual",
+        accuracyMeters: null
+      };
+      setMapCenter(coordinates);
+      setMapSelectionLocation(suggestionLocation);
+      setMapOpen(true);
+      setLocationInput(address);
+      if (operationId !== locationOperationRef.current) return;
+      if (controller.signal.aborted) return;
+      if (isGooglePlace) {
+        setLocationMessage({ type: "status", text: locationConfirmationText(suggestionLocation) });
+        return;
+      }
+
+      setLocationMessage({ type: "status", text: "Verifying the selected location…" });
+      const { response, body } = await reverseGeocodeLocation(
+        coordinates.lat,
+        coordinates.lng,
         controller.signal
       );
       if (operationId !== locationOperationRef.current) return;
@@ -876,17 +977,18 @@ export default function App() {
       const verified = body.location;
       const normalize = (value) => String(value || "").toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
       if (!verified?.city || !verified?.country ||
-        normalize(verified.city) !== normalize(suggestion.city) ||
-        normalize(verified.country) !== normalize(suggestion.country)) {
+        String(verified.state || "").replace(/\s+/g, "").toLocaleLowerCase() !== "tamilnadu" ||
+        normalize(verified.city) !== normalize(place.city) ||
+        normalize(verified.country) !== normalize(place.country)) {
         setMapSelectionLocation({ ...suggestionLocation, address: "", label: "" });
         setLocationInput("");
         throw new Error("That point does not resolve inside the selected city and country. Choose another suggestion.");
       }
       const selectedLocation = {
         ...verified,
-        address: String(verified.address || verified.label || body.address || suggestionAddress),
-        label: String(verified.address || verified.label || body.address || suggestionAddress),
-        pincode: verified.pincode || suggestion.pincode || "",
+        address: String(verified.address || verified.label || body.address || address),
+        label: String(verified.address || verified.label || body.address || address),
+        pincode: verified.pincode || place.pincode || "",
         ...coordinates,
         source: "manual",
         accuracyMeters: null
@@ -1117,7 +1219,7 @@ export default function App() {
                   ? mapOpen ? "Looking up selected point…" : "Finding your location…"
                   : "Area, street, landmark, or pincode"}
               /></span>
-              {locationSuggestionsOpen && locationSuggestions.length > 0 && (
+              {!mapOpen && locationSuggestionsOpen && locationSuggestions.length > 0 && (
                 <div className="suggestion-dropdown location-suggestions" role="listbox" aria-label="Location suggestions">
                   {locationSuggestions.map((location) => (
                     <button
@@ -1204,35 +1306,95 @@ export default function App() {
           </div>
         </form>
 
-        {mapOpen && mapCenter && (
+        {mapOpen && (
           <div className="location-map-backdrop">
             <section className="location-map-dialog" role="dialog" aria-modal="true" aria-labelledby="map-picker-title">
               <div className="location-map-heading">
                 <div>
                   <span className="section-overline">LOCATION FALLBACK</span>
                   <h2 id="map-picker-title">Pick on map</h2>
-                  <p>Choose a point or drag the pin. Confirm after checking its address.</p>
+                  <p>Search Tamil Nadu or choose a point and drag the pin to refine it.</p>
                 </div>
                 <button className="plain-button" type="button" onClick={closeMapPicker}>Close</button>
               </div>
-              <LocationMapPicker center={mapCenter} selectedPoint={mapSelectionLocation} onPick={pickMapLocation} />
+              <div className="location-map-search">
+                <label htmlFor="map-location-search">Search Tamil Nadu</label>
+                <input
+                  id="map-location-search"
+                  role="combobox"
+                  aria-autocomplete="list"
+                  aria-expanded={locationSuggestionsOpen}
+                  aria-controls="map-location-suggestions"
+                  value={mapSearchInput}
+                  onChange={(event) => {
+                    setMapSearchInput(event.target.value);
+                    setLocationSuggestionsOpen(true);
+                  }}
+                  onFocus={() => setLocationSuggestionsOpen(true)}
+                  placeholder="Area, city, or pincode"
+                />
+                {locationSuggestionsOpen && locationSuggestions.length > 0 && (
+                  <div
+                    className="suggestion-dropdown location-suggestions map-location-suggestions"
+                    id="map-location-suggestions"
+                    role="listbox"
+                    aria-label="Tamil Nadu location suggestions"
+                  >
+                    {locationSuggestions.map((suggestion) => (
+                      <button
+                        type="button"
+                        role="option"
+                        className="suggestion-option"
+                        key={`${suggestion.lat},${suggestion.lng}`}
+                        onMouseDown={(event) => event.preventDefault()}
+                        onClick={() => selectLocation(suggestion)}
+                      >
+                        <Icon name="pin" size={15} />
+                        <span>{[suggestion.area, suggestion.city, suggestion.pincode].filter(Boolean).join(", ")}</span>
+                        <small>Select</small>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <LocationMapPicker
+                center={mapCenter || MAP_DEFAULT_CENTER}
+                selectedPoint={mapSelectionLocation}
+                onPick={pickMapLocation}
+              />
               <div className="map-location-footer" aria-live="polite">
                 <div className="map-location-footer-address" aria-busy={locationBusy}>
-                  {mapSelectionLocation?.address
-                    ? <p>{mapSelectionLocation.address}</p>
-                    : <p>{locationBusy ? "Looking up the selected address…" : "Choose a point or search for an address."}</p>}
+                  <label htmlFor="selected-map-address">Selected address</label>
+                  <input
+                    id="selected-map-address"
+                    value={mapSelectionLocation?.address || ""}
+                    onChange={(event) => {
+                      const address = event.target.value;
+                      setMapSelectionLocation((current) => current
+                        ? { ...current, address, label: address }
+                        : current);
+                      setLocationMessage({ type: "status", text: "Address edited manually." });
+                    }}
+                    placeholder={locationBusy ? "Looking up address…" : "Type or correct the address"}
+                    disabled={!mapSelectionLocation || locationBusy}
+                  />
                   {mapSelectionLocation && (
                     <small className="location-coordinates">({formatCoordinates(mapSelectionLocation)})</small>
                   )}
-                  {locationMessage?.type === "error" && (
-                    <p className="map-location-error" role="alert">{locationMessage.text}</p>
+                  {locationMessage && (
+                    <p
+                      className={locationMessage.type === "error" ? "map-location-error" : "map-location-status"}
+                      role={locationMessage.type === "error" ? "alert" : "status"}
+                    >
+                      {locationMessage.text}
+                    </p>
                   )}
                 </div>
                 <button
                   className="compare-button map-confirm-button"
                   type="button"
                   disabled={locationBusy}
-                  onClick={confirmMapLocation}
+                  onClick={() => confirmMapLocation(mapSelectionLocation)}
                 >
                   {locationBusy && <span className="confirm-spinner" aria-hidden="true" />}
                   <span>OK / Confirm Location</span>

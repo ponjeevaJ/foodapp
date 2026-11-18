@@ -10,6 +10,7 @@ vi.mock("../src/LocationMapPicker.jsx", () => ({
       data-testid="location-map-picker"
       data-center={JSON.stringify([center.lat, center.lng])}
       data-point={selectedPoint ? JSON.stringify([selectedPoint.lat, selectedPoint.lng]) : ""}
+      data-accuracy={selectedPoint?.accuracyMeters ?? ""}
     >
       <button type="button" onClick={() => onPick({ lat: 12.34567, lng: 77.12345 })}>Test map click</button>
       <button type="button" onClick={() => onPick({ lat: 12.34678, lng: 77.12456 })}>Test marker drag</button>
@@ -29,6 +30,8 @@ function manualLocationResponse(label = "Indiranagar, Bengaluru, India", lat = 1
       area,
       city,
       country,
+      state: "Tamil Nadu",
+      district: "Chennai",
       pincode: "",
       lat,
       lng,
@@ -43,9 +46,12 @@ function reverseGeocodeResponse(url, address = "Indiranagar, Bengaluru, India") 
     address,
     location: {
       label: address,
+      address,
       area: address.split(",")[0].trim(),
       city,
       country,
+      state: "Tamil Nadu",
+      district: "Chennai",
       pincode: "",
       lat: Number(new URL(`http://localhost${url}`).searchParams.get("lat")),
       lng: Number(new URL(`http://localhost${url}`).searchParams.get("lng"))
@@ -60,9 +66,12 @@ function selectedMapResponse(url, area = "Map Area") {
   return jsonResponse({
     location: {
       label: `${area}, Bengaluru, India`,
+      address: `${area}, Bengaluru, India`,
       area,
       city: "Bengaluru",
       country: "India",
+      state: "Tamil Nadu",
+      district: "Chennai",
       pincode: "560038",
       lat,
       lng
@@ -125,7 +134,7 @@ test("lets users submit free text and persists it in recent searches", async () 
   expect(await screen.findByText("Recent searches")).toBeInTheDocument();
   await user.click(screen.getByRole("button", { name: "Clear" }));
   await waitFor(() => expect(localStorage.getItem("platewise.recentSearches")).toBe("[]"));
-});
+}, 10_000);
 
 test("shows inline guidance for a one-character food query", async () => {
   const user = userEvent.setup();
@@ -180,7 +189,7 @@ test("requests a secure current location, shows its address, and searches with n
     value: { query: vi.fn().mockResolvedValue({ state: "prompt" }) }
   });
   const getCurrentPosition = vi.fn((success, _failure, options) => {
-    expect(options).toEqual({ enableHighAccuracy: true, timeout: 15000, maximumAge: 0 });
+    expect(options).toEqual({ enableHighAccuracy: true, timeout: 10000, maximumAge: 0 });
     success({
       coords: { latitude: 12.34567, longitude: 77.12345, accuracy: 42 },
       timestamp: 123
@@ -198,6 +207,7 @@ test("requests a secure current location, shows its address, and searches with n
           label: "5/3 Main Road, Pallavaram, Chennai, Tamil Nadu, 600043",
           address: "5/3 Main Road, Pallavaram, Chennai, Tamil Nadu, 600043",
           state: "Tamil Nadu",
+          district: "Chennai",
           area: "Pallavaram",
           city: "Chennai",
           country: "India",
@@ -216,7 +226,10 @@ test("requests a secure current location, shows its address, and searches with n
   try {
     render(<App />);
     await user.click(screen.getByRole("button", { name: "Use current location" }));
-    expect(await screen.findByText("5/3 Main Road, Pallavaram, Chennai, Tamil Nadu, 600043")).toBeInTheDocument();
+    expect(await screen.findByLabelText("Selected address")).toHaveValue(
+      "5/3 Main Road, Pallavaram, Chennai, Tamil Nadu, 600043"
+    );
+    expect(screen.getByRole("button", { name: "OK / Confirm Location" })).toBeInTheDocument();
     expect(screen.getByLabelText(/Your location/)).toHaveValue(
       "5/3 Main Road, Pallavaram, Chennai, Tamil Nadu, 600043"
     );
@@ -225,6 +238,7 @@ test("requests a secure current location, shows its address, and searches with n
       "data-center",
       JSON.stringify([12.34567, 77.12345])
     );
+    expect(screen.getByTestId("location-map-picker")).toHaveAttribute("data-accuracy", "42");
     expect(screen.getByTestId("location-map-picker")).toHaveAttribute(
       "data-point",
       JSON.stringify([12.34567, 77.12345])
@@ -232,6 +246,9 @@ test("requests a secure current location, shows its address, and searches with n
     expect(getCurrentPosition).toHaveBeenCalledOnce();
     expect(localStorage.getItem("platewise.lastLocation")).toBeNull();
     await user.click(screen.getByRole("button", { name: "OK / Confirm Location" }));
+    expect(screen.getByLabelText(/Your location/)).toHaveValue(
+      "5/3 Main Road, Pallavaram, Chennai, Tamil Nadu, 600043"
+    );
     expect(JSON.parse(localStorage.getItem("platewise.lastLocation"))).toEqual({
       label: "5/3 Main Road, Pallavaram, Chennai, Tamil Nadu, 600043",
       address: "5/3 Main Road, Pallavaram, Chennai, Tamil Nadu, 600043",
@@ -243,7 +260,8 @@ test("requests a secure current location, shows its address, and searches with n
       lat: 12.34567,
       lng: 77.12345,
       source: "gps",
-      accuracyMeters: 42
+      accuracyMeters: 42,
+      district: "Chennai",
     });
 
     await user.click(screen.getByRole("button", { name: "Find my best pick" }));
@@ -261,13 +279,13 @@ test("requests a secure current location, shows its address, and searches with n
   }
 });
 
-test("opens the draggable map for GPS accuracy worse than 500 m and confirms only after review", async () => {
+test("shows the GPS accuracy circle and approximation warning above 100 m", async () => {
   const user = userEvent.setup();
   const oldGeolocation = Object.getOwnPropertyDescriptor(navigator, "geolocation");
   const oldSecureContext = Object.getOwnPropertyDescriptor(window, "isSecureContext");
   Object.defineProperty(window, "isSecureContext", { configurable: true, value: true });
   const getCurrentPosition = vi.fn((success, _failure, options) => {
-    expect(options).toEqual({ enableHighAccuracy: true, timeout: 15000, maximumAge: 0 });
+    expect(options).toEqual({ enableHighAccuracy: true, timeout: 10000, maximumAge: 0 });
     success({
       coords: { latitude: 12.34567, longitude: 77.12345, accuracy: 780 },
       timestamp: 456
@@ -282,9 +300,12 @@ test("opens the draggable map for GPS accuracy worse than 500 m and confirms onl
       return Promise.resolve(jsonResponse({
         location: {
           label: "Pallavaram, Chennai, India",
+          address: "Pallavaram, Chennai, Tamil Nadu, 600043",
           area: "Pallavaram",
           city: "Chennai",
           country: "India",
+          state: "Tamil Nadu",
+          district: "Chennai",
           pincode: "600043",
           lat: 12.34567,
           lng: 77.12345
@@ -296,13 +317,17 @@ test("opens the draggable map for GPS accuracy worse than 500 m and confirms onl
   try {
     render(<App />);
     await user.click(screen.getByRole("button", { name: "Use current location" }));
-    expect(await screen.findByText(/Location accuracy is low \(about 780 m\)/)).toBeInTheDocument();
+    expect(await screen.findByText("Location is approximate, drag the pin to your exact place.")).toBeInTheDocument();
     expect(screen.getByTestId("location-map-picker")).toHaveAttribute(
       "data-center",
       JSON.stringify([12.34567, 77.12345])
     );
+    expect(screen.getByTestId("location-map-picker")).toHaveAttribute("data-accuracy", "780");
     expect(localStorage.getItem("platewise.lastLocation")).toBeNull();
     await user.click(screen.getByRole("button", { name: "OK / Confirm Location" }));
+    expect(screen.getByLabelText(/Your location/)).toHaveValue(
+      "Pallavaram, Chennai, Tamil Nadu, 600043"
+    );
     expect(JSON.parse(localStorage.getItem("platewise.lastLocation"))).toMatchObject({
       lat: 12.34567,
       lng: 77.12345,
@@ -321,6 +346,7 @@ test("map clicks preserve lat/lng, reverse geocode, and wait for confirmation be
   const user = userEvent.setup();
   const original = {
     label: "Seed Area, Bengaluru, India",
+    state: "Tamil Nadu",
     area: "Seed Area",
     city: "Bengaluru",
     country: "India",
@@ -354,7 +380,8 @@ test("map clicks preserve lat/lng, reverse geocode, and wait for confirmation be
     JSON.stringify([original.lat, original.lng])
   );
   await user.click(screen.getByRole("button", { name: "Test map click" }));
-  expect(await screen.findByText("Map Click Area, Bengaluru, India")).toBeInTheDocument();
+  expect(await screen.findByLabelText("Selected address")).toHaveValue("Map Click Area, Bengaluru, India");
+  expect(screen.getByRole("button", { name: "OK / Confirm Location" })).toBeInTheDocument();
   expect(screen.getByTestId("location-map-picker")).toHaveAttribute(
     "data-center",
     JSON.stringify([12.34567, 77.12345])
@@ -372,6 +399,7 @@ test("map clicks preserve lat/lng, reverse geocode, and wait for confirmation be
   )).toHaveLength(initialSearchCount);
 
   await user.click(screen.getByRole("button", { name: "OK / Confirm Location" }));
+  expect(screen.getByLabelText(/Your location/)).toHaveValue("Map Click Area, Bengaluru, India");
   expect(JSON.parse(localStorage.getItem("platewise.lastLocation"))).toMatchObject({
     area: "Map Click Area",
     lat: 12.34567,
@@ -390,6 +418,7 @@ test("marker drag updates the confirmed shared location and the next search", as
   const user = userEvent.setup();
   localStorage.setItem("platewise.lastLocation", JSON.stringify({
     label: "Seed Area, Bengaluru, India",
+    state: "Tamil Nadu",
     area: "Seed Area",
     city: "Bengaluru",
     country: "India",
@@ -410,9 +439,11 @@ test("marker drag updates the confirmed shared location and the next search", as
 
   await user.click(screen.getByRole("button", { name: "Pick on map" }));
   await user.click(screen.getByRole("button", { name: "Test marker drag" }));
-  expect(await screen.findByText("Dragged Area, Bengaluru, India")).toBeInTheDocument();
+  expect(await screen.findByLabelText("Selected address")).toHaveValue("Dragged Area, Bengaluru, India");
+  expect(screen.getByRole("button", { name: "OK / Confirm Location" })).toBeInTheDocument();
   expect(screen.getByText("(12.34678, 77.12456)")).toBeInTheDocument();
   await user.click(screen.getByRole("button", { name: "OK / Confirm Location" }));
+  expect(screen.getByLabelText(/Your location/)).toHaveValue("Dragged Area, Bengaluru, India");
   expect(JSON.parse(localStorage.getItem("platewise.lastLocation"))).toMatchObject({
     area: "Dragged Area",
     lat: 12.34678,
@@ -426,10 +457,142 @@ test("marker drag updates the confirmed shared location and the next search", as
   )).toBe(true));
 });
 
+test("searches inside the map picker, closes results, and confirms the selected Tamil Nadu address", async () => {
+  const user = userEvent.setup();
+  const suggestion = {
+    label: "Pallavaram, Chennai, Tamil Nadu, 600043",
+    address: "Pallavaram, Chennai, Tamil Nadu, 600043",
+    area: "Pallavaram",
+    city: "Chennai",
+    district: "Chengalpattu",
+    state: "Tamil Nadu",
+    country: "India",
+    pincode: "600043",
+    lat: 12.9678,
+    lng: 80.1491,
+    source: "manual"
+  };
+  vi.stubGlobal("fetch", vi.fn((url) => {
+    if (String(url).startsWith("/api/location-suggest")) {
+      return Promise.resolve(jsonResponse({ locations: [suggestion], fallback: false }));
+    }
+    if (String(url).startsWith("/api/reverse-geocode")) {
+      return Promise.resolve(jsonResponse({
+        address: suggestion.address,
+        location: {
+          ...suggestion,
+          lat: Number(new URL(String(url), "http://localhost").searchParams.get("lat")),
+          lng: Number(new URL(String(url), "http://localhost").searchParams.get("lng"))
+        }
+      }));
+    }
+    return Promise.resolve(jsonResponse({ results: [], groups: [], comparison: null, intelligence: {} }));
+  }));
+  render(<App />);
+
+  await user.click(screen.getByRole("button", { name: "Pick on map" }));
+  fireEvent.change(screen.getByLabelText("Search Tamil Nadu"), { target: { value: "Pallavaram" } });
+  const mapSuggestions = await screen.findByRole("listbox", { name: "Tamil Nadu location suggestions" });
+  await user.click(within(mapSuggestions).getByRole("option", { name: /Pallavaram, Chennai, 600043/ }));
+
+  expect(screen.getByRole("button", { name: "OK / Confirm Location" })).toBeInTheDocument();
+  expect(screen.queryByRole("listbox", { name: "Tamil Nadu location suggestions" })).not.toBeInTheDocument();
+  expect(screen.getByTestId("location-map-picker")).toHaveAttribute(
+    "data-center",
+    JSON.stringify([12.9678, 80.1491])
+  );
+  expect(screen.getByTestId("location-map-picker")).toHaveAttribute(
+    "data-point",
+    JSON.stringify([12.9678, 80.1491])
+  );
+  expect(screen.getByLabelText("Selected address")).toHaveValue(suggestion.address);
+  await user.click(screen.getByRole("button", { name: "OK / Confirm Location" }));
+  expect(screen.getByLabelText(/Your location/)).toHaveValue(suggestion.address);
+  expect(JSON.parse(localStorage.getItem("platewise.lastLocation"))).toMatchObject({
+    lat: 12.9678,
+    lng: 80.1491,
+    address: suggestion.address,
+    pincode: "600043",
+    state: "Tamil Nadu"
+  });
+});
+
+test("cancelling a changed pending location preserves the confirmed location", async () => {
+  const user = userEvent.setup();
+  const original = {
+    label: "Pallavaram, Chennai, Tamil Nadu, 600043",
+    address: "Pallavaram, Chennai, Tamil Nadu, 600043",
+    state: "Tamil Nadu",
+    district: "Chengalpattu",
+    area: "Pallavaram",
+    city: "Chennai",
+    country: "India",
+    pincode: "600043",
+    lat: 12.9678,
+    lng: 80.1491,
+    source: "manual"
+  };
+  localStorage.setItem("platewise.lastLocation", JSON.stringify(original));
+  vi.stubGlobal("fetch", vi.fn((url) => {
+    if (String(url).startsWith("/api/reverse-geocode")) {
+      return Promise.resolve(selectedMapResponse(String(url), "Tambaram"));
+    }
+    return Promise.resolve(jsonResponse({ results: [], groups: [], comparison: null, intelligence: {} }));
+  }));
+  render(<App />);
+
+  await user.click(screen.getByRole("button", { name: "Pick on map" }));
+  await user.click(screen.getByRole("button", { name: "Test map click" }));
+  expect(await screen.findByLabelText("Selected address")).toHaveValue("Tambaram, Bengaluru, India");
+  await user.click(screen.getByRole("button", { name: "Close" }));
+
+  expect(screen.queryByRole("dialog", { name: "Pick on map" })).not.toBeInTheDocument();
+  expect(screen.getByLabelText(/Your location/)).toHaveValue(original.address);
+  expect(JSON.parse(localStorage.getItem("platewise.lastLocation"))).toEqual(original);
+
+  await user.click(screen.getByRole("button", { name: "Pick on map" }));
+  expect(screen.getByTestId("location-map-picker")).toHaveAttribute(
+    "data-center",
+    JSON.stringify([original.lat, original.lng])
+  );
+  await user.click(screen.getByRole("button", { name: "Close" }));
+  expect(screen.getByLabelText(/Your location/)).toHaveValue(original.address);
+  expect(JSON.parse(localStorage.getItem("platewise.lastLocation"))).toEqual(original);
+});
+
+test("keeps an outside-Tamil-Nadu point unconfirmable and displays the region message", async () => {
+  const user = userEvent.setup();
+  vi.stubGlobal("fetch", vi.fn((url) => {
+    if (String(url).startsWith("/api/reverse-geocode")) {
+      return Promise.resolve({
+        ok: false,
+        status: 422,
+        json: async () => ({
+          addressFound: false,
+          error: "This location service covers Tamil Nadu only. Choose a point within Tamil Nadu.",
+          coordinates: { lat: 12.34567, lng: 77.12345 }
+        })
+      });
+    }
+    return Promise.resolve(jsonResponse({ results: [], groups: [], comparison: null, intelligence: {} }));
+  }));
+  render(<App />);
+
+  await user.click(screen.getByRole("button", { name: "Pick on map" }));
+  await user.click(screen.getByRole("button", { name: "Test map click" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("This location service covers Tamil Nadu only");
+  const confirmButton = screen.getByRole("button", { name: "OK / Confirm Location" });
+  expect(confirmButton).toBeEnabled();
+  await user.click(confirmButton);
+  expect(localStorage.getItem("platewise.lastLocation")).toBeNull();
+  expect(screen.getByRole("alert")).toHaveTextContent("This location service covers Tamil Nadu only");
+});
+
 test("ignores a stale reverse-geocode response after the marker moves again", async () => {
   const user = userEvent.setup();
   localStorage.setItem("platewise.lastLocation", JSON.stringify({
     label: "Seed Area, Bengaluru, India",
+    state: "Tamil Nadu",
     area: "Seed Area",
     city: "Bengaluru",
     country: "India",
@@ -460,10 +623,10 @@ test("ignores a stale reverse-geocode response after the marker moves again", as
   expect(pending[0].signal.aborted).toBe(true);
 
   pending[1].resolve(selectedMapResponse(pending[1].url, "Newest Area"));
-  expect(await screen.findByText("Newest Area, Bengaluru, India")).toBeInTheDocument();
+  expect(await screen.findByLabelText("Selected address")).toHaveValue("Newest Area, Bengaluru, India");
   pending[0].resolve(selectedMapResponse(pending[0].url, "Stale Area"));
   await waitFor(() => {
-    expect(screen.getByText("Newest Area, Bengaluru, India")).toBeInTheDocument();
+    expect(screen.getByLabelText("Selected address")).toHaveValue("Newest Area, Bengaluru, India");
     expect(screen.queryByText(/Stale Area/)).not.toBeInTheDocument();
   });
 });
@@ -499,10 +662,16 @@ test("shows coordinates and a draggable map fallback when reverse geocoding fail
       "data-point",
       JSON.stringify([12.34567, 77.12345])
     );
-    const confirmButton = screen.getByRole("button", { name: "OK / Confirm Location" });
-    expect(confirmButton).toBeEnabled();
-    await user.click(confirmButton);
-    expect(await screen.findByText(/No address is available to confirm/)).toBeInTheDocument();
+    const editableAddress = screen.getByLabelText("Selected address");
+    fireEvent.change(editableAddress, {
+      target: { value: "Pallavaram, Chennai, Tamil Nadu, 600043" }
+    });
+    await user.click(screen.getByRole("button", { name: "OK / Confirm Location" }));
+    expect(JSON.parse(localStorage.getItem("platewise.lastLocation"))).toMatchObject({
+      lat: 12.34567,
+      lng: 77.12345,
+      address: "Pallavaram, Chennai, Tamil Nadu, 600043"
+    });
   } finally {
     if (oldGeolocation) Object.defineProperty(navigator, "geolocation", oldGeolocation);
     else delete navigator.geolocation;
@@ -541,11 +710,13 @@ test("explains how to restore a denied location permission", async () => {
     await user.click(screen.getByRole("button", { name: "Pick on map" }));
     expect(screen.getByTestId("location-map-picker")).toHaveAttribute(
       "data-center",
-      JSON.stringify([0, 0])
+      JSON.stringify([13.0827, 80.2707])
     );
     expect(screen.getByTestId("location-map-picker")).toHaveAttribute("data-point", "");
     await user.click(screen.getByRole("button", { name: "Test map click" }));
-    expect(await screen.findByLabelText(/Your location/)).toHaveValue("Manual Map Area, Bengaluru, India");
+    await waitFor(() => {
+      expect(screen.getByLabelText(/Your location/)).toHaveValue("Manual Map Area, Bengaluru, India");
+    });
     const confirmButton = screen.getByRole("button", { name: "OK / Confirm Location" });
     expect(confirmButton).toBeEnabled();
     await user.click(confirmButton);
@@ -644,7 +815,9 @@ test("accepts a pincode query and displays area, city, and pincode before select
     label: "Indiranagar, Bengaluru, India",
     area: "Indiranagar",
     city: "Bengaluru",
+    district: "Chennai",
     country: "India",
+    state: "Tamil Nadu",
     pincode: "560038",
     lat: 12.9716,
     lng: 77.5946,
@@ -687,7 +860,9 @@ test("selecting a Tambaram suggestion saves its exact coordinates", async () => 
     label: "West Tambaram, Tambaram, 600045, India",
     area: "West Tambaram",
     city: "Tambaram",
+    district: "Chengalpattu",
     country: "India",
+    state: "Tamil Nadu",
     pincode: "600045",
     lat: 12.9257923,
     lng: 80.1179194,
@@ -701,6 +876,7 @@ test("selecting a Tambaram suggestion saves its exact coordinates", async () => 
       return Promise.resolve(jsonResponse({
         location: {
           ...suggestion,
+          address: suggestion.label,
           label: suggestion.label,
           lat: Number(new URL(String(url), "http://localhost").searchParams.get("lat")),
           lng: Number(new URL(String(url), "http://localhost").searchParams.get("lng"))

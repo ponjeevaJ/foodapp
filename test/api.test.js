@@ -261,6 +261,7 @@ test("reverse-geocodes the exact coordinates and prefers suburb over neighbourho
         suburb: "Pallavaram",
         neighbourhood: "Old Neighbourhood",
         city: "Chennai",
+        state_district: "Chennai",
         state: "Tamil Nadu",
         country: "India",
         postcode: "600043"
@@ -282,6 +283,7 @@ test("reverse-geocodes the exact coordinates and prefers suburb over neighbourho
     city: "Chennai",
     country: "India",
     state: "Tamil Nadu",
+    district: "Chennai",
     address: "5/3 Main Road, Pallavaram, Chennai, Tamil Nadu, 600043",
     pincode: "600043",
     lat: 11.123456,
@@ -292,6 +294,10 @@ test("reverse-geocodes the exact coordinates and prefers suburb over neighbourho
   expect(reverseUrl.origin).toBe("https://nominatim.openstreetmap.org");
   expect(reverseUrl.searchParams.get("lat")).toBe("11.123456");
   expect(reverseUrl.searchParams.get("lon")).toBe("76.999987");
+  expect(reverseUrl.searchParams.get("zoom")).toBe("18");
+  expect(reverseUrl.searchParams.get("addressdetails")).toBe("1");
+  expect(reverseUrl.searchParams.get("accept-language")).toBe("en");
+  expect(fetchMock.mock.calls[0][1].headers["User-Agent"]).toContain("PlatewiseSmartCompare");
 });
 
 test("does not reuse a reverse address for nearby but different coordinates", async () => {
@@ -299,102 +305,72 @@ test("does not reuse a reverse address for nearby but different coordinates", as
     .mockResolvedValueOnce({
       ok: true,
       json: async () => ({
-        address: { suburb: "First Area", city: "Sample City", country: "India" }
+        address: { suburb: "First Area", city: "Sample City", state: "Tamil Nadu", country: "India" }
       })
     })
     .mockResolvedValueOnce({
       ok: true,
       json: async () => ({
-        address: { suburb: "Second Area", city: "Sample City", country: "India" }
+        address: { suburb: "Second Area", city: "Sample City", state: "Tamil Nadu", country: "India" }
       })
     });
   vi.stubGlobal("fetch", fetchMock);
   const app = createTestApp();
   const first = await request(app).get("/api/reverse-geocode")
-    .query({ lat: "12.34561", lng: "77.12341" });
+    .query({ lat: "12.98761", lng: "80.12341" });
   const second = await request(app).get("/api/reverse-geocode")
-    .query({ lat: "12.34564", lng: "77.12344" });
+    .query({ lat: "12.98764", lng: "80.12344" });
 
   expect(first.body.location.area).toBe("First Area");
   expect(second.body.location).toMatchObject({
     area: "Second Area",
-    lat: 12.34564,
-    lng: 77.12344
+    lat: 12.98764,
+    lng: 80.12344
   });
   expect(fetchMock).toHaveBeenCalledTimes(2);
 });
 
-test("does not reuse a cached reverse address for the same coordinates", async () => {
-  const fetchMock = vi.fn()
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        address: { suburb: "First Area", city: "Sample City", country: "India" }
-      })
+test("reuses a cached reverse address only for the exact same coordinates", async () => {
+  const fetchMock = vi.fn().mockResolvedValue({
+    ok: true,
+    json: async () => ({
+      address: {
+        suburb: "First Area",
+        city: "Sample City",
+        state: "Tamil Nadu",
+        country: "India"
+      }
     })
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        address: { suburb: "Updated Area", city: "Sample City", country: "India" }
-      })
-    });
+  });
   vi.stubGlobal("fetch", fetchMock);
   const app = createTestApp();
   const first = await request(app).get("/api/reverse-geocode")
-    .query({ lat: "12.34561", lng: "77.12341" });
+    .query({ lat: "11.223456", lng: "79.100001" });
   const second = await request(app).get("/api/reverse-geocode")
-    .query({ lat: "12.34561", lng: "77.12341" });
+    .query({ lat: "11.223456", lng: "79.100001" });
 
   expect(first.body.location.area).toBe("First Area");
-  expect(second.body.location.area).toBe("Updated Area");
-  expect(fetchMock).toHaveBeenCalledTimes(2);
+  expect(second.body.location.area).toBe("First Area");
+  expect(fetchMock).toHaveBeenCalledOnce();
 });
 
-test("falls back to Photon when Nominatim returns no usable reverse address", async () => {
-  const fetchMock = vi.fn()
-    .mockResolvedValueOnce({ ok: true, json: async () => ({ address: {} }) })
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        features: [{
-          properties: {
-            suburb: "West Tambaram",
-            city: "Tambaram",
-            country: "India",
-            countrycode: "IN",
-            postcode: "600045"
-          }
-        }]
-      })
-    });
+test("does not fall back to another provider when Nominatim has no address", async () => {
+  const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ address: {} }) });
   vi.stubGlobal("fetch", fetchMock);
   const response = await request(createTestApp())
     .get("/api/reverse-geocode")
     .query({ lat: "12.9257923", lng: "80.1179194" });
 
-  expect(response.status).toBe(200);
+  expect(response.status).toBe(502);
   expect(response.body).toMatchObject({
-    addressFound: true,
-    address: "West Tambaram, Tambaram, 600045",
-    location: {
-      area: "West Tambaram",
-      city: "Tambaram",
-      pincode: "600045",
-      lat: 12.9257923,
-      lng: 80.1179194
-    }
+    addressFound: false,
+    coordinates: { lat: 12.9257923, lng: 80.1179194 }
   });
-  const photonUrl = new URL(fetchMock.mock.calls[1][0].toString());
-  expect(photonUrl.origin).toBe("https://photon.komoot.io");
-  expect(photonUrl.pathname).toBe("/reverse");
-  expect(photonUrl.searchParams.get("lat")).toBe("12.9257923");
-  expect(photonUrl.searchParams.get("lon")).toBe("80.1179194");
+  expect(fetchMock).toHaveBeenCalledOnce();
 });
 
-test("returns the coordinate fallback message when both reverse geocoders fail", async () => {
-  vi.stubGlobal("fetch", vi.fn()
-    .mockRejectedValueOnce(new Error("Nominatim offline"))
-    .mockRejectedValueOnce(new Error("Photon offline")));
+test("returns the coordinate fallback message when Nominatim fails", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockRejectedValueOnce(new Error("Nominatim offline")));
   const response = await request(createTestApp())
     .get("/api/reverse-geocode")
     .query({ lat: "12.5", lng: "77.5" });
@@ -415,181 +391,168 @@ test("validates reverse-geocoding coordinates", async () => {
   expect(response.status).toBe(400);
 });
 
-test("finds Tambaram with Photon and maps its selected coordinates", async () => {
-  const fetchMock = vi.fn().mockResolvedValue({
+test("rejects reverse-geocoded points outside Tamil Nadu", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
     ok: true,
     json: async () => ({
-      features: [{
-        properties: {
-          name: "West Tambaram",
-          suburb: "West Tambaram",
-          city: "Tambaram",
-          country: "India",
-          countrycode: "IN",
-          postcode: "600045"
-        },
-        geometry: { coordinates: [80.1179194, 12.9257923] }
-      }]
+      address: {
+        suburb: "Indiranagar",
+        city: "Bengaluru",
+        state: "Karnataka",
+        country: "India"
+      }
     })
-  });
-  vi.stubGlobal("fetch", fetchMock);
+  }));
   const response = await request(createTestApp())
-    .get("/api/location-suggest")
-    .query({ q: "Tambaram", city: "Chennai", lat: "13.0827", lng: "80.2707" });
+    .get("/api/reverse-geocode")
+    .query({ lat: "12.9716", lng: "77.5946" });
 
-  expect(response.status).toBe(200);
-  expect(response.body).toMatchObject({
-    fallback: false,
-    originalQuery: "Tambaram",
-    locations: [{
-      label: "West Tambaram, Tambaram, 600045, India",
-      area: "West Tambaram",
-      city: "Tambaram",
-      country: "India",
-      pincode: "600045",
-      lat: 12.9257923,
-      lng: 80.1179194,
-      source: "manual"
-    }]
-  });
-  const photonUrl = new URL(fetchMock.mock.calls[0][0].toString());
-  expect(photonUrl.origin).toBe("https://photon.komoot.io");
-  expect(photonUrl.searchParams.get("q")).toBe("Tambaram, India");
-  expect(photonUrl.searchParams.get("lat")).toBe("13.0827");
-  expect(photonUrl.searchParams.get("lon")).toBe("80.2707");
-  expect(photonUrl.searchParams.get("limit")).toBe("6");
+  expect(response.status).toBe(422);
+  expect(response.body.error).toMatch(/Tamil Nadu only/);
+  expect(response.body.coordinates).toEqual({ lat: 12.9716, lng: 77.5946 });
 });
 
-test("looks up a six-digit pincode directly", async () => {
+test("searches Nominatim with the Tamil Nadu-only viewbox and parses lat/lon strings", async () => {
   const fetchMock = vi.fn().mockResolvedValue({
     ok: true,
-    json: async () => ({
-      features: [{
-        properties: {
-          name: "600045",
-          city: "Tambaram",
-          country: "India",
-          countrycode: "IN"
-        },
-        geometry: { coordinates: [80.1150525, 12.9245279] }
-      }]
-    })
+    json: async () => [{
+      lat: "12.9257923",
+      lon: "80.1179194",
+      address: {
+        neighbourhood: "West Tambaram",
+        town: "Tambaram",
+        state_district: "Chengalpattu",
+        state: "Tamil Nadu",
+        country: "India",
+        postcode: "600045"
+      }
+    }]
   });
   vi.stubGlobal("fetch", fetchMock);
   const response = await request(createTestApp())
     .get("/api/location-suggest")
-    .query({ q: "600045" });
+    .query({ q: "Tambaram" });
 
   expect(response.status).toBe(200);
   expect(response.body.locations[0]).toMatchObject({
-    area: "Tambaram",
+    area: "West Tambaram",
     city: "Tambaram",
+    district: "Chengalpattu",
+    state: "Tamil Nadu",
     pincode: "600045",
-    lat: 12.9245279,
-    lng: 80.1150525
+    lat: 12.9257923,
+    lng: 80.1179194
   });
-  expect(new URL(fetchMock.mock.calls[0][0].toString()).searchParams.get("q"))
-    .toBe("600045, India");
+  const nominatimUrl = new URL(fetchMock.mock.calls[0][0].toString());
+  expect(nominatimUrl.origin).toBe("https://nominatim.openstreetmap.org");
+  expect(nominatimUrl.pathname).toBe("/search");
+  expect(nominatimUrl.searchParams.get("q")).toBe("Tambaram");
+  expect(nominatimUrl.searchParams.get("countrycodes")).toBe("in");
+  expect(nominatimUrl.searchParams.get("viewbox")).toBe("76.2,13.6,80.4,8.0");
+  expect(nominatimUrl.searchParams.get("bounded")).toBe("1");
+  expect(nominatimUrl.searchParams.get("addressdetails")).toBe("1");
+  expect(nominatimUrl.searchParams.get("limit")).toBe("5");
+  expect(fetchMock.mock.calls[0][1].headers.Referer).toBe("http://localhost:5173/");
 });
 
-test("falls back to Nominatim if Photon fails and uses a soft city bias", async () => {
-  const fetchMock = vi.fn()
-    .mockRejectedValueOnce(new Error("Photon is unavailable."))
-    .mockResolvedValueOnce({
+test("searches Tamil Nadu towns and preserves their matching pin and address", async () => {
+  const places = [
+    { query: "Pallavaram", area: "Pallavaram", city: "Chennai", district: "Chengalpattu", pincode: "600043", lat: 12.9678, lng: 80.1491 },
+    { query: "T. Nagar", area: "T. Nagar", city: "Chennai", district: "Chennai", pincode: "600017", lat: 13.0418, lng: 80.2337 },
+    { query: "Tambaram", area: "West Tambaram", city: "Tambaram", district: "Chengalpattu", pincode: "600045", lat: 12.9249, lng: 80.1 },
+    { query: "Coimbatore", area: "Coimbatore", city: "Coimbatore", district: "Coimbatore", pincode: "641001", lat: 11.0168, lng: 76.9558 },
+    { query: "Madurai", area: "Madurai", city: "Madurai", district: "Madurai", pincode: "625001", lat: 9.9252, lng: 78.1198 },
+    { query: "Trichy", area: "Trichy", city: "Tiruchirappalli", district: "Tiruchirappalli", pincode: "620001", lat: 10.7905, lng: 78.7047 },
+    { query: "Salem", area: "Salem", city: "Salem", district: "Salem", pincode: "636001", lat: 11.6643, lng: 78.146 }
+  ];
+  const fetchMock = vi.fn((url) => {
+    const searchQuery = new URL(url.toString()).searchParams.get("q");
+    const place = places.find(({ query }) => searchQuery.startsWith(query));
+    return Promise.resolve({
       ok: true,
       json: async () => [{
-        lat: "12.9257923",
-        lon: "80.1179194",
-        name: "West Tambaram",
+        lat: String(place.lat),
+        lon: String(place.lng),
         address: {
-          suburb: "West Tambaram",
-          city: "Tambaram",
+          neighbourhood: place.area,
+          city: place.city,
+          state_district: place.district,
+          state: "Tamil Nadu",
           country: "India",
-          country_code: "in",
-          postcode: "600045"
+          postcode: place.pincode
         }
       }]
     });
-  vi.stubGlobal("fetch", fetchMock);
-  const response = await request(createTestApp())
-    .get("/api/location-suggest")
-    .query({ q: "Tambaram fallback", city: "Chennai", lat: "13.0827", lng: "80.2707" });
-
-  expect(response.status).toBe(200);
-  expect(response.body).toMatchObject({
-    fallback: false,
-    providerFallback: true,
-    locations: [{ area: "West Tambaram", city: "Tambaram", pincode: "600045" }]
   });
-  const nominatimUrl = new URL(fetchMock.mock.calls[1][0].toString());
-  expect(nominatimUrl.origin).toBe("https://nominatim.openstreetmap.org");
-  expect(nominatimUrl.searchParams.get("countrycodes")).toBe("in");
-  expect(nominatimUrl.searchParams.has("viewbox")).toBe(true);
-  expect(nominatimUrl.searchParams.has("bounded")).toBe(false);
-  expect(fetchMock.mock.calls[1][1].headers.Referer).toBe("http://localhost:5173/");
-}, 10000);
+  vi.stubGlobal("fetch", fetchMock);
+  const app = createTestApp();
 
-test("retries with a simplified area query for a numbered street address", async () => {
-  const photonResult = {
-    features: [{
-      properties: {
-        name: "Anna Nagar West",
-        suburb: "Anna Nagar West",
-        city: "Chennai",
-        country: "India",
-        countrycode: "IN",
-        postcode: "600040"
+  for (const place of places) {
+    const response = await request(app).get("/api/location-suggest")
+      .query({ q: `${place.query} TN test` });
+    expect(response.status).toBe(200);
+    expect(response.body.locations[0]).toMatchObject({
+      area: place.area,
+      city: place.city,
+      district: place.district,
+      pincode: place.pincode,
+      lat: place.lat,
+      lng: place.lng
+    });
+    expect(response.body.locations[0].address).toContain(place.pincode);
+  }
+}, 15000);
+
+test("caches repeated location searches and excludes results outside Tamil Nadu", async () => {
+  const fetchMock = vi.fn().mockResolvedValue({
+    ok: true,
+    json: async () => [
+      {
+        lat: "12.9257923",
+        lon: "80.1179194",
+        address: {
+          suburb: "West Tambaram",
+          town: "Tambaram",
+          state: "Tamil Nadu",
+          country: "India",
+          postcode: "600045"
+        }
       },
-      geometry: { coordinates: [80.2091, 13.085] }
-    }]
-  };
-  const fetchMock = vi.fn()
-    .mockResolvedValueOnce({ ok: true, json: async () => ({ features: [] }) })
-    .mockResolvedValueOnce({ ok: true, json: async () => [] })
-    .mockResolvedValueOnce({ ok: true, json: async () => ({ features: [] }) })
-    .mockResolvedValueOnce({ ok: true, json: async () => [] })
-    .mockResolvedValueOnce({ ok: true, json: async () => photonResult });
-  vi.stubGlobal("fetch", fetchMock);
-  const query = "12, Anna Nagar West, Chennai";
-  const response = await request(createTestApp())
-    .get("/api/location-suggest")
-    .query({ q: query });
-
-  expect(response.status).toBe(200);
-  expect(response.body).toMatchObject({
-    fallback: true,
-    originalQuery: query,
-    locations: [{ area: "Anna Nagar West", city: "Chennai", pincode: "600040" }]
-  });
-  expect(new URL(fetchMock.mock.calls[2][0].toString()).searchParams.get("q"))
-    .toBe("Anna Nagar West, Chennai, India");
-  expect(new URL(fetchMock.mock.calls[4][0].toString()).searchParams.get("q"))
-    .toBe("Anna Nagar West, India");
-}, 10000);
-
-test("filters provider results to India", async () => {
-  const fetchMock = vi.fn((url) => {
-    if (new URL(url.toString()).origin === "https://photon.komoot.io") {
-      return Promise.resolve({
-        ok: true,
-        json: async () => ({
-          features: [{
-            properties: { name: "Central", city: "London", country: "United Kingdom", countrycode: "GB" },
-            geometry: { coordinates: [-0.1, 51.5] }
-          }]
-        })
-      });
-    }
-    return Promise.resolve({ ok: true, json: async () => [] });
+      {
+        lat: "9.9252",
+        lon: "78.1198",
+        address: {
+          city: "Madurai",
+          state: "Kerala",
+          country: "India",
+          postcode: "625001"
+        }
+      }
+    ]
   });
   vi.stubGlobal("fetch", fetchMock);
-  const response = await request(createTestApp())
-    .get("/api/location-suggest")
-    .query({ q: "Central, London" });
+  const app = createTestApp();
+  const first = await request(app).get("/api/location-suggest").query({ q: "Tambaram cache check" });
+  const second = await request(app).get("/api/location-suggest").query({ q: "Tambaram cache check" });
 
-  expect(response.status).toBe(200);
-  expect(response.body.locations).toEqual([]);
+  expect(first.body.locations).toHaveLength(1);
+  expect(second.body.locations[0].pincode).toBe("600045");
+  expect(fetchMock).toHaveBeenCalledOnce();
 });
+
+test("spaces Nominatim requests at least one second apart", async () => {
+  const requestStartedAt = [];
+  vi.stubGlobal("fetch", vi.fn().mockImplementation(async () => {
+    requestStartedAt.push(Date.now());
+    return { ok: true, json: async () => [] };
+  }));
+  const app = createTestApp();
+  await request(app).get("/api/location-suggest").query({ q: "rate limit first" });
+  await request(app).get("/api/location-suggest").query({ q: "rate limit second" });
+
+  expect(requestStartedAt).toHaveLength(2);
+  expect(requestStartedAt[1] - requestStartedAt[0]).toBeGreaterThanOrEqual(950);
+}, 5000);
 
 test("ignores location queries shorter than three characters", async () => {
   const response = await request(createTestApp())
@@ -617,10 +580,19 @@ test("rejects manual address text without selected coordinates", async () => {
   expect(response.status).toBe(400);
 });
 
-test("requires an area name alongside confirmed coordinates", async () => {
+test("searches a manually entered address even when geocoding did not provide a city", async () => {
   const response = await request(createTestApp())
     .get("/api/compare")
-    .query({ food: "biryani", ...locationQuery, area: "" });
+    .query({
+      food: "biryani",
+      lat: "12.9678",
+      lng: "80.1491",
+      address: "Pallavaram, Chennai, Tamil Nadu, 600043",
+      label: "Pallavaram, Chennai, Tamil Nadu, 600043",
+      source: "manual"
+    });
 
-  expect(response.status).toBe(400);
+  expect(response.status).toBe(200);
+  expect(new URL(response.body.results[0].searchUrl).searchParams.get("query"))
+    .toContain("Pallavaram, Chennai, Tamil Nadu, 600043");
 });

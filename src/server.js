@@ -13,7 +13,11 @@ const RATE_LIMIT = 60;
 const RATE_WINDOW_MS = 60 * 1000;
 const requestsByIp = new Map();
 const locationSuggestionCache = new Map();
-let nextReverseGeocodeAt = 0;
+const reverseGeocodeCache = new Map();
+const GEOCODER_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const GEOCODER_CACHE_MAX_ENTRIES = 500;
+const TAMIL_NADU_VIEWBOX = "76.2,13.6,80.4,8.0";
+let nextNominatimRequestAt = 0;
 
 function parseNumber(params, key, fallback) {
   const raw = params.get(key);
@@ -41,18 +45,20 @@ function parseInput(params) {
     const area = (params.get("area") || "").trim();
     const city = (params.get("city") || "").trim();
     const country = (params.get("country") || "").trim();
-    const label = (params.get("label") || "").trim();
-    const address = (params.get("address") || "").trim();
+    const district = (params.get("district") || "").trim();
+    const address = (params.get("address") || [area, city].filter(Boolean).join(" ")).trim();
+    const label = (params.get("label") || "").trim() || address;
     const pincode = (params.get("pincode") || "").trim();
     const accuracyMeters = params.has("accuracyMeters")
       ? parseNumber(params, "accuracyMeters")
       : null;
     const source = params.get("source");
-    if (area.length > 200 || city.length > 200 || country.length > 100 || address.length > 500) {
+    if (area.length > 500 || city.length > 200 || district.length > 200 ||
+      country.length > 100 || address.length > 500) {
       throw new Error("Location labels are too long.");
     }
-    if (!area || !city || !country || !label) {
-      throw new Error("Choose a confirmed location with an area, city, and country.");
+    if (!address || !label) {
+      throw new Error("Choose a confirmed location with an address.");
     }
     if (!["gps", "manual"].includes(source)) {
       throw new Error("Choose a confirmed location before searching.");
@@ -63,11 +69,12 @@ function parseInput(params) {
     location = {
       lat,
       lng,
-      address: address || [area, city].filter(Boolean).join(" "),
+      address,
       label,
-      area,
-      areaName: area,
+      area: area || address,
+      areaName: area || address,
       city,
+      district,
       country,
       pincode,
       source,
@@ -157,9 +164,17 @@ function throwIfAborted(signal) {
   if (signal?.aborted) throw createAbortError();
 }
 
+function cacheGeocoderResult(cache, key, value) {
+  cache.delete(key);
+  cache.set(key, value);
+  if (cache.size > GEOCODER_CACHE_MAX_ENTRIES) {
+    cache.delete(cache.keys().next().value);
+  }
+}
+
 async function waitForNominatim(signal) {
-  const delay = Math.max(0, nextReverseGeocodeAt - Date.now());
-  nextReverseGeocodeAt = Date.now() + delay + 1000;
+  const delay = Math.max(0, nextNominatimRequestAt - Date.now());
+  nextNominatimRequestAt = Date.now() + delay + 1000;
   if (!delay) {
     throwIfAborted(signal);
     return;
@@ -184,22 +199,23 @@ function locationFromNominatim(body, lat, lng) {
   const address = body.address || {};
   const street = [address.house_number, address.road].filter(Boolean).join(" ");
   const area = address.suburb || address.neighbourhood || address.city_district ||
-    address.village || address.residential || address.quarter || address.road;
-  const city = address.city || address.town || address.municipality ||
-    address.village || address.county || address.state_district;
+    address.residential || address.quarter || address.road || address.village;
+  const city = address.city || address.town || address.village || address.municipality;
+  const district = address.state_district || address.county || "";
   const state = address.state || "";
-  const country = address.country;
-  if (!area || !city || !country) return null;
-  const pincode = address.postcode || "";
-  const parts = [street, area, city, state, pincode].filter(Boolean);
+  const country = address.country || "";
+  const pincode = String(address.postcode || "");
+  const parts = [street, area, city, district, state, pincode].filter(Boolean);
   const label = parts.filter((part, index) =>
     parts.findIndex((candidate) => normalizedLocationText(candidate) === normalizedLocationText(part)) === index
   ).join(", ");
+  if (!label || !state) return null;
   return {
     label,
     address: label,
-    area,
-    city,
+    area: area || city || district,
+    city: city || district,
+    district,
     country,
     state,
     pincode,
@@ -208,36 +224,17 @@ function locationFromNominatim(body, lat, lng) {
   };
 }
 
-function locationFromPhoton(body, lat, lng) {
-  const properties = body.features?.[0]?.properties || {};
-  const street = [properties.housenumber, properties.street].filter(Boolean).join(" ");
-  const area = properties.suburb || properties.neighbourhood || properties.village ||
-    properties.locality || properties.street || properties.name;
-  const city = properties.city || properties.town || properties.municipality ||
-    properties.county || properties.district;
-  const state = properties.state || "";
-  const country = properties.country ||
-    (String(properties.countrycode || "").toLowerCase() === "in" ? "India" : "");
-  if (!area || !city || !country) return null;
-  const pincode = properties.postcode || "";
-  const parts = [street, area, city, state, pincode].filter(Boolean);
-  const label = parts.filter((part, index) =>
-    parts.findIndex((candidate) => normalizedLocationText(candidate) === normalizedLocationText(part)) === index
-  ).join(", ");
-  return {
-    label,
-    address: label,
-    area,
-    city,
-    country,
-    state,
-    pincode,
-    lat,
-    lng
-  };
+function requireTamilNadu(location) {
+  if (!location) throw new Error("Nominatim returned no usable address. Type the address manually.");
+  if (normalizedLocationText(location.state) !== "tamilnadu") {
+    const error = new Error("This location service covers Tamil Nadu only. Choose a point within Tamil Nadu.");
+    error.code = "OUTSIDE_TAMIL_NADU";
+    throw error;
+  }
+  return location;
 }
 
-async function fetchReverseJson(url, signal, headers) {
+async function fetchNominatimJson(url, signal, headers) {
   throwIfAborted(signal);
   const controller = new AbortController();
   const onAbort = () => controller.abort();
@@ -246,11 +243,11 @@ async function fetchReverseJson(url, signal, headers) {
   const timer = setTimeout(() => controller.abort(), 5000);
   try {
     const response = await fetch(url, { signal: controller.signal, headers });
-    if (!response.ok) throw new Error(`Reverse geocoder returned HTTP ${response.status}.`);
+    if (!response.ok) throw new Error(`Nominatim returned HTTP ${response.status}.`);
     return await response.json();
   } catch (error) {
     if (signal?.aborted) throw createAbortError();
-    if (controller.signal.aborted) throw new Error("Reverse geocoder timed out.");
+    if (controller.signal.aborted) throw new Error("Nominatim timed out.");
     throw error;
   } finally {
     clearTimeout(timer);
@@ -259,263 +256,99 @@ async function fetchReverseJson(url, signal, headers) {
 }
 
 async function reverseGeocode(lat, lng, signal) {
-  let nominatimError;
-  try {
-    await waitForNominatim(signal);
-    const url = new URL("https://nominatim.openstreetmap.org/reverse");
-    url.searchParams.set("format", "jsonv2");
-    url.searchParams.set("lat", String(lat));
-    url.searchParams.set("lon", String(lng));
-    url.searchParams.set("zoom", "14");
-    url.searchParams.set("addressdetails", "1");
-    const body = await fetchReverseJson(url, signal, {
-      "User-Agent": "PlatewiseSmartCompare/1.0 (reverse geocoding)",
-      Referer: process.env.APP_PUBLIC_URL || "http://localhost:5173/"
-    });
-    const location = locationFromNominatim(body, lat, lng);
-    if (location) return location;
-    nominatimError = new Error("Nominatim returned no complete area and city.");
-  } catch (error) {
-    if (signal?.aborted || error.name === "AbortError") throw error;
-    nominatimError = error;
+  const key = `${lat},${lng}`;
+  const cached = reverseGeocodeCache.get(key);
+  if (cached && Date.now() - cached.createdAt < GEOCODER_CACHE_TTL_MS) {
+    console.info("Nominatim reverse coordinates:", { lat, lng });
+    console.info("Nominatim reverse response:", cached.rawResponse);
+    return requireTamilNadu(cached.location);
   }
 
-  const photonUrl = new URL("https://photon.komoot.io/reverse");
-  photonUrl.searchParams.set("lat", String(lat));
-  photonUrl.searchParams.set("lon", String(lng));
-  photonUrl.searchParams.set("lang", "en");
-  try {
-    const body = await fetchReverseJson(photonUrl, signal, {
-      "User-Agent": "PlatewiseSmartCompare/1.0 (reverse geocoding)"
-    });
-    const location = locationFromPhoton(body, lat, lng);
-    if (location) return location;
-  } catch (error) {
-    if (signal?.aborted || error.name === "AbortError") throw error;
-    throw new Error(`Address not found. Nominatim: ${nominatimError.message} Photon: ${error.message}`);
-  }
-
-  throw new Error(`Address not found. Nominatim: ${nominatimError.message} Photon returned no complete address.`);
-}
-
-function removeHouseNumber(query) {
-  return query.replace(/^\s*(?:(?:flat|door|house|plot|no\.?|#)\s*)?\d{1,5}(?:[-/]\d+[A-Za-z]?)?(?:[A-Za-z])?\s*(?:,|\s)\s*/iu, "").trim();
-}
-
-function getAreaAndCity(query, currentCity) {
-  const parts = query.split(",").map((part) => part.trim())
-    .filter((part) => part && !/^\d{6}$/.test(part) && !/^india$/i.test(part));
-  const cityIndex = currentCity
-    ? parts.findIndex((part) => part.toLocaleLowerCase() === currentCity.toLocaleLowerCase())
-    : -1;
-  if (cityIndex > 0) return { area: parts[cityIndex - 1], city: parts[cityIndex] };
-  if (parts.length > 1) return { area: parts[parts.length - 2], city: parts[parts.length - 1] };
-  if (parts.length === 1 && currentCity) return { area: parts[0], city: currentCity };
-  return null;
-}
-
-function locationQueries(query, currentCity) {
-  const simplified = removeHouseNumber(query);
-  const areaAndCity = getAreaAndCity(simplified, currentCity);
-  const candidates = [
-    { query, fallback: false },
-    { query: simplified, fallback: true },
-    { query: areaAndCity ? `${areaAndCity.area}, ${areaAndCity.city}` : "", fallback: true },
-    { query: areaAndCity?.area || "", fallback: true }
-  ];
-  return candidates.filter((candidate, index) =>
-    candidate.query.trim() && candidates.findIndex((other) =>
-      other.query.trim().toLocaleLowerCase() === candidate.query.trim().toLocaleLowerCase()
-    ) === index
-  );
+  await waitForNominatim(signal);
+  const url = new URL("https://nominatim.openstreetmap.org/reverse");
+  url.searchParams.set("format", "jsonv2");
+  url.searchParams.set("lat", String(lat));
+  url.searchParams.set("lon", String(lng));
+  url.searchParams.set("zoom", "18");
+  url.searchParams.set("addressdetails", "1");
+  url.searchParams.set("accept-language", "en");
+  const publicUrl = appPublicUrl();
+  const body = await fetchNominatimJson(url, signal, {
+    // Switch to a hosted geocoder for higher-volume production traffic.
+    "User-Agent": `PlatewiseSmartCompare/1.0 (${publicUrl})`,
+    Referer: publicUrl
+  });
+  console.info("Nominatim reverse coordinates:", { lat, lng });
+  console.info("Nominatim reverse response:", body);
+  const location = locationFromNominatim(body, lat, lng);
+  const result = { location, rawResponse: body, createdAt: Date.now() };
+  cacheGeocoderResult(reverseGeocodeCache, key, result);
+  return requireTamilNadu(location);
 }
 
 function normalizedLocationText(value) {
   return String(value || "").toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
 }
 
-function createLocationSuggestion({ area, city, country, pincode, lat, lng }) {
-  const normalizedArea = area || city;
-  const parts = [normalizedArea, city, pincode, country].filter(Boolean);
-  const label = parts.filter((part, index) =>
-    parts.findIndex((candidate) => normalizedLocationText(candidate) === normalizedLocationText(part)) === index
-  ).join(", ");
-  if (!normalizedArea || !city || !country || !label ||
-    !Number.isFinite(lat) || lat < -90 || lat > 90 ||
-    !Number.isFinite(lng) || lng < -180 || lng > 180) return null;
-  return {
-    label,
-    area: normalizedArea,
-    city,
-    country,
-    pincode: String(pincode || ""),
-    lat,
-    lng,
-    source: "manual"
-  };
+function isWithinTamilNaduBounds(lat, lng) {
+  return lat >= 8.0 && lat <= 13.6 && lng >= 76.2 && lng <= 80.4;
 }
 
-function mapNominatimResults(entries, query = "") {
-  const requestedPincode = /^\d{6}$/.test(query.trim()) ? query.trim() : "";
+function mapNominatimResults(entries) {
   return entries.map((entry) => {
-    const address = entry.address || {};
-    const city = address.city || address.town || address.municipality ||
-      address.village || address.county || address.state_district;
-    const name = /^\d{6}$/.test(String(entry.name || "").trim()) ? "" : entry.name;
-    const area = address.neighbourhood || address.suburb || address.city_district ||
-      address.residential || address.quarter || address.hamlet || address.road ||
-      (normalizedLocationText(name) !== normalizedLocationText(city) ? name : "");
-    const country = address.country || (String(address.country_code).toLowerCase() === "in" ? "India" : "");
-    return createLocationSuggestion({
-      area,
-      city,
-      country,
-      pincode: address.postcode || requestedPincode,
-      lat: Number(entry.lat),
-      lng: Number(entry.lon)
-    });
-  }).filter((entry) => entry && normalizedLocationText(entry.country) === "india").slice(0, 6);
+    const lat = Number.parseFloat(entry.lat);
+    const lng = Number.parseFloat(entry.lon);
+    const location = locationFromNominatim(entry, lat, lng);
+    if (!location ||
+      normalizedLocationText(location.state) !== "tamilnadu" ||
+      normalizedLocationText(location.country) !== "india" ||
+      !isWithinTamilNaduBounds(lat, lng)) return null;
+    return { ...location, label: location.address, source: "manual" };
+  }).filter(Boolean).slice(0, 5);
 }
 
-function mapPhotonResults(body, query = "") {
-  const requestedPincode = /^\d{6}$/.test(query.trim()) ? query.trim() : "";
-  return (body.features || []).map((feature) => {
-    const properties = feature.properties || {};
-    const coordinates = feature.geometry?.coordinates || [];
-    const city = properties.city || properties.town || properties.municipality ||
-      properties.village || properties.county || properties.district;
-    const name = /^\d{6}$/.test(String(properties.name || "").trim()) ? "" : properties.name;
-    const area = properties.suburb || properties.neighbourhood || properties.locality ||
-      properties.district || properties.street ||
-      (normalizedLocationText(name) !== normalizedLocationText(city) ? name : "");
-    const country = properties.country ||
-      (String(properties.countrycode).toLowerCase() === "in" ? "India" : "");
-    return createLocationSuggestion({
-      area,
-      city,
-      country,
-      pincode: properties.postcode || requestedPincode,
-      lat: Number(coordinates[1]),
-      lng: Number(coordinates[0])
-    });
-  }).filter((entry) => entry && normalizedLocationText(entry.country) === "india").slice(0, 6);
+function appPublicUrl() {
+  if (process.env.APP_PUBLIC_URL) return process.env.APP_PUBLIC_URL;
+  if (process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}/`;
+  return "http://localhost:5173/";
 }
 
-async function fetchGeocoderJson(url, signal, headers = {}) {
-  throwIfAborted(signal);
-  const controller = new AbortController();
-  const onAbort = () => controller.abort();
-  signal?.addEventListener("abort", onAbort, { once: true });
-  if (signal?.aborted) onAbort();
-  const timer = setTimeout(() => controller.abort(), 4000);
-  try {
-    const response = await fetch(url, {
-      signal: controller.signal,
-      headers
-    });
-    if (!response.ok) throw new Error(`Geocoding provider returned HTTP ${response.status}.`);
-    return await response.json();
-  } catch (error) {
-    if (signal?.aborted) throw createAbortError();
-    if (controller.signal.aborted) throw new Error("Geocoding provider timed out.");
-    throw error;
-  } finally {
-    clearTimeout(timer);
-    signal?.removeEventListener("abort", onAbort);
-  }
-}
-
-function softViewbox(bias) {
-  if (!Number.isFinite(bias.lat) || !Number.isFinite(bias.lng)) return "";
-  const extent = 0.1;
-  return [
-    bias.lng - extent,
-    bias.lat + extent,
-    bias.lng + extent,
-    bias.lat - extent
-  ].join(",");
-}
-
-async function searchPhoton(query, bias, signal) {
-  const url = new URL("https://photon.komoot.io/api/");
-  const photonQuery = /(?:^|,\s*)india$/i.test(query) ? query : `${query}, India`;
-  url.searchParams.set("q", photonQuery);
-  url.searchParams.set("limit", "6");
-  url.searchParams.set("lang", "en");
-  if (Number.isFinite(bias.lat) && Number.isFinite(bias.lng)) {
-    url.searchParams.set("lat", String(bias.lat));
-    url.searchParams.set("lon", String(bias.lng));
-  }
-  const body = await fetchGeocoderJson(url, signal, { "User-Agent": "PlatewiseSmartCompare/1.0" });
-  return mapPhotonResults(body, query);
-}
-
-async function searchNominatim(query, bias, signal) {
-  await waitForNominatim(signal);
+async function searchNominatim(query, signal) {
   const url = new URL("https://nominatim.openstreetmap.org/search");
   url.searchParams.set("format", "jsonv2");
   url.searchParams.set("addressdetails", "1");
-  url.searchParams.set("limit", "6");
+  url.searchParams.set("accept-language", "en");
+  url.searchParams.set("limit", "5");
   url.searchParams.set("countrycodes", "in");
   url.searchParams.set("q", query);
-  const viewbox = softViewbox(bias);
-  if (viewbox) url.searchParams.set("viewbox", viewbox);
-  const body = await fetchGeocoderJson(url, signal, {
-    "User-Agent": "PlatewiseSmartCompare/1.0 (location autocomplete)",
-    Referer: process.env.APP_PUBLIC_URL || "http://localhost:5173/"
+  url.searchParams.set("viewbox", TAMIL_NADU_VIEWBOX);
+  url.searchParams.set("bounded", "1");
+  const publicUrl = appPublicUrl();
+  const body = await fetchNominatimJson(url, signal, {
+    // Switch to a hosted geocoder for higher-volume production traffic.
+    "User-Agent": `PlatewiseSmartCompare/1.0 (${publicUrl})`,
+    Referer: publicUrl
   });
-  return mapNominatimResults(body, query);
+  console.info("Nominatim search query:", query);
+  console.info("Nominatim search response:", body);
+  return body;
 }
 
-async function suggestLocations(query, bias = {}, signal) {
+async function suggestLocations(query, _bias = {}, signal) {
   const normalizedQuery = query.trim().replace(/\s+/g, " ");
-  const normalizedBias = {
-    city: String(bias.city || "").trim(),
-    lat: Number.isFinite(Number(bias.lat)) ? Number(bias.lat) : NaN,
-    lng: Number.isFinite(Number(bias.lng)) ? Number(bias.lng) : NaN
-  };
-  const key = `${normalizedQuery.toLocaleLowerCase()}|${normalizedBias.city.toLocaleLowerCase()}|${normalizedBias.lat}|${normalizedBias.lng}`;
+  const key = normalizedQuery.toLocaleLowerCase();
   const cached = locationSuggestionCache.get(key);
-  if (cached && Date.now() - cached.createdAt < 60 * 60 * 1000) return cached.result;
+  if (cached && Date.now() - cached.createdAt < GEOCODER_CACHE_TTL_MS) {
+    console.info("Nominatim search query:", normalizedQuery);
+    console.info("Nominatim search response:", cached.rawResponse);
+    return cached.result;
+  }
 
-  let successfulResponse = false;
-  let lastError = null;
-  let result = { locations: [], fallback: false, originalQuery: normalizedQuery };
-  for (const candidate of locationQueries(normalizedQuery, normalizedBias.city)) {
-    let querySucceeded = false;
-    for (const [provider, search] of [
-      ["photon", searchPhoton],
-      ["nominatim", searchNominatim]
-    ]) {
-      throwIfAborted(signal);
-      try {
-        const locations = await search(candidate.query, normalizedBias, signal);
-        successfulResponse = true;
-        querySucceeded = true;
-        if (locations.length) {
-          result = {
-            locations,
-            fallback: candidate.fallback,
-            provider,
-            providerFallback: provider !== "photon",
-            originalQuery: normalizedQuery
-          };
-          break;
-        }
-      } catch (error) {
-        if (signal?.aborted || error.name === "AbortError") throw error;
-        lastError = error;
-      }
-    }
-    if (result.locations.length) break;
-    if (!querySucceeded) {
-      throw new Error("Location service unavailable. Check your internet and try again.");
-    }
-  }
-  if (!successfulResponse && lastError) {
-    throw new Error("Location service unavailable. Check your internet and try again.");
-  }
-  locationSuggestionCache.set(key, { createdAt: Date.now(), result });
+  await waitForNominatim(signal);
+  const rawResponse = await searchNominatim(normalizedQuery, signal);
+  const locations = mapNominatimResults(rawResponse);
+  const result = { locations, fallback: false, originalQuery: normalizedQuery };
+  cacheGeocoderResult(locationSuggestionCache, key, { createdAt: Date.now(), result, rawResponse });
   return result;
 }
 
@@ -615,7 +448,7 @@ function createServer({ logNoResults = (entry) => console.warn(JSON.stringify(en
         }
       } catch (error) {
         if (!controller.signal.aborted && !response.destroyed) {
-          sendJson(response, 502, {
+          sendJson(response, error.code === "OUTSIDE_TAMIL_NADU" ? 422 : 502, {
             error: error.message || "Address lookup failed.",
             addressFound: false,
             fallbackMessage: "Address not found. Drag the pin or type your area",
